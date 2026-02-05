@@ -106,6 +106,7 @@ describe('Config Validation', () => {
         'git push': ['/usr/bin/nc'],
       },
       enableWeakerNestedSandbox: true,
+      enableWeakerNetworkIsolation: false,
     }
 
     const result = SandboxRuntimeConfigSchema.safeParse(config)
@@ -127,16 +128,12 @@ describe('Config Validation', () => {
   })
 
   test('should validate wildcard domains correctly', () => {
-    const validWildcards = [
-      '*.example.com',
-      '*.github.io',
-      '*.co.uk',
-    ]
+    const validWildcards = ['*.example.com', '*.github.io', '*.co.uk']
 
     const invalidWildcards = [
-      '*example.com',  // Missing dot after asterisk
-      '*.com',         // No subdomain
-      '*.',            // Invalid format
+      '*example.com', // Missing dot after asterisk
+      '*.com', // No subdomain
+      '*.', // Invalid format
     ]
 
     for (const domain of validWildcards) {
@@ -155,6 +152,27 @@ describe('Config Validation', () => {
       }
       const result = SandboxRuntimeConfigSchema.safeParse(config)
       expect(result.success).toBe(false)
+    }
+  })
+
+  test('should validate config with enableWeakerNetworkIsolation', () => {
+    const config = {
+      network: {
+        allowedDomains: ['example.com'],
+        deniedDomains: [],
+      },
+      filesystem: {
+        denyRead: [],
+        allowWrite: [],
+        denyWrite: [],
+      },
+      enableWeakerNetworkIsolation: true,
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(true)
+    if (result.success) {
+      expect(result.data.enableWeakerNetworkIsolation).toBe(true)
     }
   })
 

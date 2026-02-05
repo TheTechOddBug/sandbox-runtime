@@ -33,6 +33,7 @@ export interface MacOSSandboxParams {
   ignoreViolations?: IgnoreViolationsConfig | undefined
   allowPty?: boolean
   allowGitConfig?: boolean
+  enableWeakerNetworkIsolation?: boolean
   binShell?: string
 }
 
@@ -328,6 +329,7 @@ function generateSandboxProfile({
   allowLocalBinding,
   allowPty,
   allowGitConfig = false,
+  enableWeakerNetworkIsolation = false,
   logTag,
 }: {
   readConfig: FsReadRestrictionConfig | undefined
@@ -340,6 +342,7 @@ function generateSandboxProfile({
   allowLocalBinding?: boolean
   allowPty?: boolean
   allowGitConfig?: boolean
+  enableWeakerNetworkIsolation?: boolean
   logTag: string
 }): string {
   const profile: string[] = [
@@ -376,6 +379,13 @@ function generateSandboxProfile({
     '  (global-name "com.apple.securityd.xpc")',
     '  (global-name "com.apple.coreservices.launchservicesd")',
     ')',
+    '',
+    ...(enableWeakerNetworkIsolation
+      ? [
+          '; trustd.agent - needed for Go TLS certificate verification (weaker network isolation)',
+          '(allow mach-lookup (global-name "com.apple.trustd.agent"))',
+        ]
+      : []),
     '',
     '; POSIX IPC - shared memory',
     '(allow ipc-posix-shm)',
@@ -615,6 +625,7 @@ export function wrapCommandWithSandboxMacOS(
     writeConfig,
     allowPty,
     allowGitConfig = false,
+    enableWeakerNetworkIsolation = false,
     binShell,
   } = params
 
@@ -646,6 +657,7 @@ export function wrapCommandWithSandboxMacOS(
     allowLocalBinding,
     allowPty,
     allowGitConfig,
+    enableWeakerNetworkIsolation,
     logTag,
   })
 
