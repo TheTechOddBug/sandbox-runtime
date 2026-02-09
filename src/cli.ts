@@ -175,6 +175,11 @@ async function main(): Promise<void> {
 
           // Handle process exit
           child.on('exit', (code, signal) => {
+            // Clean up bwrap mount point artifacts before exiting.
+            // On Linux, bwrap creates empty files on the host when protecting
+            // non-existent deny paths. This removes them.
+            SandboxManager.cleanupAfterCommand()
+
             if (signal) {
               if (signal === 'SIGINT' || signal === 'SIGTERM') {
                 process.exit(0)

@@ -19,6 +19,7 @@ import {
   type LinuxNetworkBridgeContext,
   checkLinuxDependencies,
   type SandboxDependencyCheck,
+  cleanupBwrapMountPoints,
 } from './linux-sandbox-utils.js'
 import {
   wrapCommandWithSandboxMacOS,
@@ -638,7 +639,24 @@ function updateConfig(newConfig: SandboxRuntimeConfig): void {
   logForDebugging('Sandbox configuration updated')
 }
 
+/**
+ * Lightweight cleanup to call after each sandboxed command completes.
+ *
+ * On Linux, bwrap creates empty files on the host filesystem as mount points
+ * when protecting non-existent deny paths (e.g. ~/.bashrc, ~/.gitconfig).
+ * These persist after bwrap exits. This function removes them.
+ *
+ * Safe to call on any platform — it's a no-op on macOS.
+ * Also called automatically by reset() and on process exit as safety nets.
+ */
+function cleanupAfterCommand(): void {
+  cleanupBwrapMountPoints()
+}
+
 async function reset(): Promise<void> {
+  // Clean up any leftover bwrap mount points
+  cleanupAfterCommand()
+
   // Stop log monitor
   if (logMonitorShutdown) {
     logMonitorShutdown()
@@ -905,6 +923,7 @@ export interface ISandboxManager {
   getLinuxGlobPatternWarnings(): string[]
   getConfig(): SandboxRuntimeConfig | undefined
   updateConfig(newConfig: SandboxRuntimeConfig): void
+  cleanupAfterCommand(): void
   reset(): Promise<void>
 }
 
@@ -934,6 +953,7 @@ export const SandboxManager: ISandboxManager = {
   getLinuxSocksSocketPath,
   waitForNetworkInitialization,
   wrapWithSandbox,
+  cleanupAfterCommand,
   reset,
   getSandboxViolationStore,
   annotateStderrWithSandboxFailures,

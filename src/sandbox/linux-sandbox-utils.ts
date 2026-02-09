@@ -102,6 +102,30 @@ function findSymlinkInPath(
 }
 
 /**
+ * Find the first non-existent path component.
+ * E.g., for "/existing/parent/nonexistent/child/file.txt" where /existing/parent exists,
+ * returns "/existing/parent/nonexistent"
+ *
+ * This is used to block creation of non-existent deny paths by mounting /dev/null
+ * at the first missing component, preventing mkdir from creating the parent directories.
+ */
+function findFirstNonExistentComponent(targetPath: string): string {
+  const parts = targetPath.split(path.sep)
+  let currentPath = ''
+
+  for (const part of parts) {
+    if (!part) continue // Skip empty parts (leading /)
+    const nextPath = currentPath + path.sep + part
+    if (!fs.existsSync(nextPath)) {
+      return nextPath
+    }
+    currentPath = nextPath
+  }
+
+  return targetPath // Shouldn't reach here if called correctly
+}
+
+/**
  * Get mandatory deny paths using ripgrep (Linux only).
  * Uses a SINGLE ripgrep call with multiple glob patterns for efficiency.
  * With --max-depth limiting, this is fast enough to run on each command without memoization.
@@ -212,12 +236,19 @@ async function linuxGetMandatoryDenyPaths(
 
 // Track generated seccomp filters for cleanup on process exit
 const generatedSeccompFilters: Set<string> = new Set()
+
+// Track mount points created by bwrap for non-existent deny paths.
+// When bwrap does --ro-bind /dev/null /nonexistent/path, it creates an empty
+// file on the host as a mount point. These persist after bwrap exits and must
+// be cleaned up explicitly.
+const bwrapMountPoints: Set<string> = new Set()
+
 let exitHandlerRegistered = false
 
 /**
- * Register cleanup handler for generated seccomp filters
+ * Register cleanup handler for generated seccomp filters and bwrap mount points
  */
-function registerSeccompCleanupHandler(): void {
+function registerExitCleanupHandler(): void {
   if (exitHandlerRegistered) {
     return
   }
@@ -230,9 +261,45 @@ function registerSeccompCleanupHandler(): void {
         // Ignore cleanup errors during exit
       }
     }
+    cleanupBwrapMountPoints()
   })
 
   exitHandlerRegistered = true
+}
+
+/**
+ * Clean up mount point files created by bwrap for non-existent deny paths.
+ *
+ * When protecting non-existent deny paths, bwrap creates empty files on the
+ * host filesystem as mount points for --ro-bind. These files persist after
+ * bwrap exits. This function removes them.
+ *
+ * This should be called after each sandboxed command completes to prevent
+ * ghost dotfiles (e.g. .bashrc, .gitconfig) from appearing in the working
+ * directory. It is also called automatically on process exit as a safety net.
+ *
+ * Safe to call at any time — it only removes files that were tracked during
+ * generateFilesystemArgs() and skips any that no longer exist.
+ */
+export function cleanupBwrapMountPoints(): void {
+  for (const mountPoint of bwrapMountPoints) {
+    try {
+      // Only remove if it's still the empty file bwrap created.
+      // If something else has written real content, leave it alone.
+      if (fs.existsSync(mountPoint)) {
+        const stat = fs.statSync(mountPoint)
+        if (stat.isFile() && stat.size === 0) {
+          fs.unlinkSync(mountPoint)
+          logForDebugging(
+            `[Sandbox Linux] Cleaned up bwrap mount point: ${mountPoint}`,
+          )
+        }
+      }
+    } catch {
+      // Ignore cleanup errors — the file may have already been removed
+    }
+  }
+  bwrapMountPoints.clear()
 }
 
 /**
@@ -587,12 +654,42 @@ async function generateFilesystemArgs(
         continue
       }
 
-      // Skip non-existent paths - no protection needed
-      // Mounting /dev/null over non-existent paths creates empty files on host
+      // Handle non-existent paths by mounting /dev/null to block creation.
+      // Without this, a sandboxed process could mkdir+write a denied path that
+      // doesn't exist yet, bypassing the deny rule entirely.
+      //
+      // bwrap creates empty files on the host as mount points for these binds.
+      // We track them in bwrapMountPoints so cleanupBwrapMountPoints() can
+      // remove them after the command exits.
       if (!fs.existsSync(normalizedPath)) {
-        logForDebugging(
-          `[Sandbox Linux] Skipping non-existent deny path: ${normalizedPath}`,
+        // Find the deepest existing ancestor directory
+        let ancestorPath = path.dirname(normalizedPath)
+        while (ancestorPath !== '/' && !fs.existsSync(ancestorPath)) {
+          ancestorPath = path.dirname(ancestorPath)
+        }
+
+        // Only protect if the existing ancestor is within an allowed write path.
+        // If not, the path is already read-only from --ro-bind / /.
+        const ancestorIsWithinAllowedPath = allowedWritePaths.some(
+          allowedPath =>
+            ancestorPath.startsWith(allowedPath + '/') ||
+            ancestorPath === allowedPath ||
+            normalizedPath.startsWith(allowedPath + '/'),
         )
+
+        if (ancestorIsWithinAllowedPath) {
+          const firstNonExistent = findFirstNonExistentComponent(normalizedPath)
+          args.push('--ro-bind', '/dev/null', firstNonExistent)
+          bwrapMountPoints.add(firstNonExistent)
+          registerExitCleanupHandler()
+          logForDebugging(
+            `[Sandbox Linux] Mounted /dev/null at ${firstNonExistent} to block creation of ${normalizedPath}`,
+          )
+        } else {
+          logForDebugging(
+            `[Sandbox Linux] Skipping non-existent deny path not within allowed paths: ${normalizedPath}`,
+          )
+        }
         continue
       }
 
@@ -761,7 +858,7 @@ export async function wrapCommandWithSandboxLinux(
         // Only track runtime-generated filters (not pre-generated ones from vendor/)
         if (!seccompFilterPath.includes('/vendor/seccomp/')) {
           generatedSeccompFilters.add(seccompFilterPath)
-          registerSeccompCleanupHandler()
+          registerExitCleanupHandler()
         }
 
         logForDebugging(
