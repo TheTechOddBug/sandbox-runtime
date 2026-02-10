@@ -450,6 +450,10 @@ function getEnableWeakerNestedSandbox(): boolean | undefined {
   return config?.enableWeakerNestedSandbox
 }
 
+function getEnableWeakerNetworkIsolation(): boolean | undefined {
+  return config?.enableWeakerNetworkIsolation
+}
+
 function getRipgrepConfig(): { command: string; args?: string[] } {
   return config?.ripgrep ?? { command: 'rg' }
 }
@@ -580,6 +584,7 @@ async function wrapWithSandbox(
         ignoreViolations: getIgnoreViolations(),
         allowPty,
         allowGitConfig: getAllowGitConfig(),
+        enableWeakerNetworkIsolation: getEnableWeakerNetworkIsolation(),
         binShell,
       })
 
