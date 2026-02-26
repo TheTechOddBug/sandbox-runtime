@@ -4,6 +4,9 @@ import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { getPlatform } from '../../src/utils/platform.js'
 import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
+import { mkdirSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 /**
  * Create a test configuration with network access
@@ -649,5 +652,69 @@ describe('empty allowedDomains network blocking (CVE fix)', () => {
       // Main config has example.com, so proxy should be set up
       expect(result).toContain('HTTP_PROXY')
     })
+  })
+})
+
+describe('allowWrite glob suffix handling', () => {
+  const command = 'echo hello'
+
+  it('allowWrite with /** suffix includes path in sandbox command', async () => {
+    if (skipIfUnsupportedPlatform()) {
+      return
+    }
+
+    const testDir = join(tmpdir(), `srt-test-glob-allow-${Date.now()}`)
+    mkdirSync(testDir, { recursive: true })
+
+    try {
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: [],
+          allowWrite: [`${testDir}/**`],
+          denyWrite: [],
+        },
+      })
+
+      const result = await SandboxManager.wrapWithSandbox(command)
+
+      expect(result).not.toBe(command)
+      expect(result).toContain(testDir)
+    } finally {
+      await SandboxManager.reset()
+      rmSync(testDir, { recursive: true, force: true })
+    }
+  })
+
+  it('denyWrite with /** suffix within allowed parent includes both paths', async () => {
+    if (skipIfUnsupportedPlatform()) {
+      return
+    }
+
+    const parentDir = join(tmpdir(), `srt-test-glob-deny-${Date.now()}`)
+    const childDir = join(parentDir, 'denied')
+    mkdirSync(childDir, { recursive: true })
+
+    try {
+      await SandboxManager.reset()
+      await SandboxManager.initialize({
+        network: { allowedDomains: [], deniedDomains: [] },
+        filesystem: {
+          denyRead: [],
+          allowWrite: [parentDir],
+          denyWrite: [`${childDir}/**`],
+        },
+      })
+
+      const result = await SandboxManager.wrapWithSandbox(command)
+
+      expect(result).not.toBe(command)
+      expect(result).toContain(parentDir)
+      expect(result).toContain(childDir)
+    } finally {
+      await SandboxManager.reset()
+      rmSync(parentDir, { recursive: true, force: true })
+    }
   })
 })

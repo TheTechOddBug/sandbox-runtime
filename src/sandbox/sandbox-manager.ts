@@ -519,12 +519,30 @@ async function wrapWithSandbox(
   // Get configs - use custom if provided, otherwise fall back to main config
   // If neither exists, defaults to empty arrays (most restrictive)
   // Always include default system write paths (like /dev/null, /tmp/claude)
-  const userAllowWrite =
-    customConfig?.filesystem?.allowWrite ?? config?.filesystem.allowWrite ?? []
+  //
+  // Strip trailing /** and filter remaining globs on Linux (bwrap needs
+  // real paths, not globs; macOS subpath matching is also recursive so
+  // stripping is harmless there).
+  const stripWriteGlobs = (paths: string[]): string[] =>
+    paths
+      .map(p => removeTrailingGlobSuffix(p))
+      .filter(p => {
+        if (getPlatform() === 'linux' && containsGlobChars(p)) {
+          logForDebugging(
+            `[Sandbox] Skipping glob write pattern on Linux: ${p}`,
+          )
+          return false
+        }
+        return true
+      })
+  const userAllowWrite = stripWriteGlobs(
+    customConfig?.filesystem?.allowWrite ?? config?.filesystem.allowWrite ?? [],
+  )
   const writeConfig = {
     allowOnly: [...getDefaultWritePaths(), ...userAllowWrite],
-    denyWithinAllow:
+    denyWithinAllow: stripWriteGlobs(
       customConfig?.filesystem?.denyWrite ?? config?.filesystem.denyWrite ?? [],
+    ),
   }
   const rawDenyRead =
     customConfig?.filesystem?.denyRead ?? config?.filesystem.denyRead ?? []

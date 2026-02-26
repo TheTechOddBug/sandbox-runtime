@@ -69,7 +69,8 @@ export function containsGlobChars(pathPattern: string): boolean {
  * Used to normalize path patterns since /** just means "directory and everything under it"
  */
 export function removeTrailingGlobSuffix(pathPattern: string): string {
-  return pathPattern.replace(/\/\*\*$/, '')
+  const stripped = pathPattern.replace(/\/\*\*$/, '')
+  return stripped || '/'
 }
 
 /**
