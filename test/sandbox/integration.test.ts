@@ -1366,3 +1366,102 @@ describe('Empty allowedDomains Network Blocking Integration', () => {
     })
   })
 })
+
+// ============================================================================
+// Git over SSH through proxy (GIT_SSH_COMMAND)
+// Regression test for https://github.com/anthropic-experimental/sandbox-runtime/issues/161
+// ============================================================================
+
+describe('Git over SSH through sandbox proxy', () => {
+  const TEST_DIR = join(process.cwd(), '.sandbox-git-ssh-test-tmp')
+
+  beforeAll(async () => {
+    if (skipIfNotLinux()) {
+      return
+    }
+
+    if (!existsSync(TEST_DIR)) {
+      mkdirSync(TEST_DIR, { recursive: true })
+    }
+
+    await SandboxManager.reset()
+    await SandboxManager.initialize({
+      network: {
+        allowedDomains: ['github.com'],
+        deniedDomains: [],
+      },
+      filesystem: {
+        denyRead: [],
+        allowWrite: [TEST_DIR],
+        denyWrite: [],
+      },
+    })
+  })
+
+  afterAll(async () => {
+    if (skipIfNotLinux()) {
+      return
+    }
+    if (existsSync(TEST_DIR)) {
+      rmSync(TEST_DIR, { recursive: true, force: true })
+    }
+    await SandboxManager.reset()
+  })
+
+  it('should set GIT_SSH_COMMAND to route SSH through socat proxy on Linux', async () => {
+    if (skipIfNotLinux()) {
+      return
+    }
+
+    const command = await SandboxManager.wrapWithSandbox(
+      'echo "$GIT_SSH_COMMAND"',
+    )
+
+    const result = spawnSync(command, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 5000,
+    })
+
+    expect(result.status).toBe(0)
+    const gitSshCommand = result.stdout.trim()
+    // Must be set (issue #161: was empty on Linux)
+    expect(gitSshCommand).not.toBe('')
+    // Must route through socat HTTP CONNECT proxy
+    expect(gitSshCommand).toContain('ssh -o ProxyCommand=')
+    expect(gitSshCommand).toContain('socat - PROXY:localhost:')
+  })
+
+  it('should resolve DNS and connect when running git over SSH', async () => {
+    if (skipIfNotLinux()) {
+      return
+    }
+
+    // Use /dev/null as identity to force clean publickey rejection without
+    // depending on whatever keys or ssh-agent happen to be present in CI.
+    // -o StrictHostKeyChecking=no + UserKnownHostsFile=/dev/null avoids known_hosts writes.
+    // GIT_SSH_COMMAND is already set by the sandbox; these options stack on top.
+    const command = await SandboxManager.wrapWithSandbox(
+      'GIT_SSH_COMMAND="$GIT_SSH_COMMAND -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -i /dev/null" ' +
+        'git ls-remote ssh://git@github.com/anthropic-experimental/sandbox-runtime.git HEAD 2>&1',
+    )
+
+    const result = spawnSync(command, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 15000,
+    })
+
+    const output = (result.stdout + result.stderr).toLowerCase()
+
+    // This is the bug from #161. If GIT_SSH_COMMAND isn't set, ssh tries to
+    // resolve github.com inside the --unshare-net namespace and fails here.
+    expect(output).not.toContain('could not resolve hostname')
+    expect(output).not.toContain('temporary failure in name resolution')
+
+    // With /dev/null as the only identity, github rejects auth after a
+    // successful TCP connect + SSH handshake. Reaching this error proves
+    // DNS resolution and the proxy tunnel both worked.
+    expect(output).toContain('permission denied (publickey)')
+  }, 20000)
+})
