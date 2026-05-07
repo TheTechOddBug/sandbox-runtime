@@ -7,49 +7,74 @@
  * requires the caller to provide both paths.
  */
 
+import forge from 'node-forge'
 import { readFileSync } from 'node:fs'
+import type { SecureContext } from 'node:tls'
 import { logForDebugging } from '../utils/debug.js'
+import type { LeafCert } from './mitm-leaf.js'
+
+const { pki } = forge
 
 export type MitmCA = {
   certPath: string
   keyPath: string
   certPem: string
   keyPem: string
+  /** Parsed CA certificate (issuer for minted leaf certs). */
+  cert: forge.pki.Certificate
+  /** Parsed CA private key. RSA only. */
+  key: forge.pki.rsa.PrivateKey
+  /** Per-hostname cache of leaf certs minted against this CA. */
+  leafCerts: Map<string, LeafCert>
+  /** Per-hostname cache of TLS SecureContexts wrapping the leaf certs. */
+  secureContexts: Map<string, SecureContext>
 }
 
-let ca: MitmCA | undefined
-
 /**
- * Load the MITM CA from the given paths. Throws if either file is missing,
- * unreadable, or not PEM — TLS termination is explicit opt-in, so a bad
- * config is a hard error (same posture as checkDependencies()).
+ * Create a MitmCA from the given paths. Throws if either file is missing,
+ * unreadable, not PEM, fails to parse, or the key is not RSA — TLS
+ * termination is explicit opt-in, so a bad config is a hard error (same
+ * posture as checkDependencies()).
  *
- * Idempotent: subsequent calls return the cached CA.
+ * Pure factory: no module-level state. The caller (SandboxManager) owns the
+ * returned object and its lifetime.
  */
-export function loadMitmCA(opts: {
+export function createMitmCA(opts: {
   caCertPath: string
   caKeyPath: string
 }): MitmCA {
-  if (ca) return ca
-
   const { caCertPath: certPath, caKeyPath: keyPath } = opts
 
   const certPem = readPem(certPath, 'CERTIFICATE', 'tlsTerminate.caCertPath')
   const keyPem = readPem(keyPath, 'PRIVATE KEY', 'tlsTerminate.caKeyPath')
 
-  ca = { certPath, keyPath, certPem, keyPem }
+  let cert: forge.pki.Certificate
+  let key: forge.pki.PrivateKey
+  try {
+    cert = pki.certificateFromPem(certPem)
+    key = pki.privateKeyFromPem(keyPem)
+  } catch (err) {
+    throw new Error(
+      `tlsTerminate: failed to parse CA from ${certPath}: ` +
+        (err as Error).message,
+    )
+  }
+  if (!('n' in key) || !('d' in key)) {
+    // node-forge can only sign with RSA private keys.
+    throw new Error(`tlsTerminate.caKeyPath: CA key at ${keyPath} must be RSA`)
+  }
+
   logForDebugging(`[mitm-ca] loaded CA from ${certPath}`)
-  return ca
-}
-
-/** Return the cached CA, or undefined if tlsTerminate was not configured. */
-export function getMitmCA(): MitmCA | undefined {
-  return ca
-}
-
-/** Clear the cached CA — for tests / config reload. */
-export function resetMitmCA(): void {
-  ca = undefined
+  return {
+    certPath,
+    keyPath,
+    certPem,
+    keyPem,
+    cert,
+    key: key as forge.pki.rsa.PrivateKey,
+    leafCerts: new Map(),
+    secureContexts: new Map(),
+  }
 }
 
 function readPem(path: string, label: string, field: string): string {

@@ -1,7 +1,7 @@
 import { createHttpProxyServer } from './http-proxy.js'
 import { createSocksProxyServer } from './socks-proxy.js'
 import type { SocksProxyWrapper } from './socks-proxy.js'
-import { loadMitmCA, resetMitmCA } from './mitm-ca.js'
+import { createMitmCA, type MitmCA } from './mitm-ca.js'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
@@ -61,6 +61,7 @@ let initializationPromise: Promise<HostNetworkManagerContext> | undefined
 let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
 let parentProxy: ResolvedParentProxy | undefined
+let mitmCA: MitmCA | undefined
 const sandboxViolationStore = new SandboxViolationStore()
 
 // ============================================================================
@@ -280,9 +281,9 @@ async function initialize(
 
   // Load TLS-termination CA if configured. Throws on unreadable/non-PEM —
   // tlsTerminate is explicit opt-in, so a bad config is a hard error.
-  if (runtimeConfig.network.tlsTerminate) {
-    loadMitmCA(runtimeConfig.network.tlsTerminate)
-  }
+  mitmCA = runtimeConfig.network.tlsTerminate
+    ? createMitmCA(runtimeConfig.network.tlsTerminate)
+    : undefined
 
   // Check dependencies
   const deps = checkDependencies()
@@ -937,7 +938,7 @@ async function reset(): Promise<void> {
   managerContext = undefined
   initializationPromise = undefined
   parentProxy = undefined
-  resetMitmCA()
+  mitmCA = undefined
 }
 
 function getSandboxViolationStore() {
@@ -1045,6 +1046,7 @@ export interface ISandboxManager {
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
   getLinuxGlobPatternWarnings(): string[]
   getConfig(): SandboxRuntimeConfig | undefined
+  getMitmCA(): MitmCA | undefined
   updateConfig(newConfig: SandboxRuntimeConfig): void
   cleanupAfterCommand(): void
   reset(): Promise<void>
@@ -1079,6 +1081,7 @@ export const SandboxManager: ISandboxManager = {
   wrapWithSandbox,
   cleanupAfterCommand,
   reset,
+  getMitmCA: () => mitmCA,
   getSandboxViolationStore,
   annotateStderrWithSandboxFailures,
   getLinuxGlobPatternWarnings,
