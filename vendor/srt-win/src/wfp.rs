@@ -560,9 +560,8 @@ pub fn install_filters(sublayer: &GUID, group_sid: &str) -> Result<()> {
     }
 
     let result: Result<()> = (|| {
-        // Sublayer (idempotent). The display name identifies the
-        // owning tool, not the group — one sublayer may carry filters
-        // for several groups/users.
+        // Sublayer (idempotent). Display name identifies the owning
+        // tool, not the group.
         let mut sl_name = wstr("srt-win");
         let mut sl_desc =
             wstr("sandbox-runtime WFP sublayer (deny-only-group fence)");
@@ -722,8 +721,6 @@ pub fn uninstall_filters(sublayer: &GUID) -> Result<usize> {
             return Err(e);
         }
     };
-    // Try to delete the sublayer; FWP_E_IN_USE means foreign
-    // filters are still under it — fine.
     let rc = unsafe { FwpmSubLayerDeleteByKey0(engine.h(), sublayer) };
     if rc != 0
         && rc != FWP_E_SUBLAYER_NOT_FOUND

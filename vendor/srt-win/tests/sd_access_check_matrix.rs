@@ -145,9 +145,9 @@ fn check(token: HANDLE, sddl: &str) -> bool {
         )
         .expect("ConvertStringSecurityDescriptorToSecurityDescriptorW");
     }
-    // GENERIC_MAPPING is required even though we ask for a specific
-    // (already-mapped) bit; map everything to that bit so
-    // MapGenericMask inside AccessCheck is a no-op.
+    // GENERIC_MAPPING is required by the API but irrelevant here:
+    // DESIRED_ACCESS has no generic bits set, so MapGenericMask
+    // never consults this table.
     let mapping = GENERIC_MAPPING {
         GenericRead: GENERIC_READ.0,
         GenericWrite: GENERIC_WRITE.0,
