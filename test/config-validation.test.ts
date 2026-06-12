@@ -336,17 +336,17 @@ describe('Config Validation', () => {
       }
     })
 
-    test('accepts file and env var entries with deny/allow modes', () => {
+    test('accepts file and env var entries with deny mode', () => {
       const result = SandboxRuntimeConfigSchema.safeParse({
         ...base,
         credentials: {
           files: [
             { path: '~/.netrc', mode: 'deny' },
-            { path: '~/.aws', mode: 'allow' },
+            { path: '~/.aws', mode: 'deny' },
           ],
           envVars: [
             { name: 'AWS_SECRET_ACCESS_KEY', mode: 'deny' },
-            { name: 'GH_TOKEN', mode: 'allow' },
+            { name: 'GH_TOKEN', mode: 'deny' },
           ],
         },
       })
@@ -355,6 +355,16 @@ describe('Config Validation', () => {
         expect(result.data.credentials?.files).toHaveLength(2)
         expect(result.data.credentials?.envVars).toHaveLength(2)
       }
+    })
+
+    test('rejects mode "allow" — no longer a valid mode', () => {
+      const result = SandboxRuntimeConfigSchema.safeParse({
+        ...base,
+        credentials: {
+          files: [{ path: '~/.aws', mode: 'allow' }],
+        },
+      })
+      expect(result.success).toBe(false)
     })
 
     test('accepts an empty credentials object', () => {

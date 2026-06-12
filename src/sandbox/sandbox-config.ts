@@ -116,19 +116,17 @@ const ParentProxyConfigSchema = z.object({
  *
  * - `deny` — the sandboxed process cannot read the file / does not see the
  *   environment variable.
- * - `allow` — currently a no-op: SRT applies no default credential
- *   protections, so there is nothing for an `allow` entry to exempt. The
- *   mode is reserved for future semantics (opting a source out of default
- *   protections or credential masking, should those ship).
  * - `mask` — reserved for credential masking; rejected until masking ships.
+ *
+ * Additional modes (e.g. a working `mask`) will be added in future releases.
  */
 const credentialModeSchema = z
-  .enum(['deny', 'allow', 'mask'])
+  .enum(['deny', 'mask'])
   .refine(mode => mode !== 'mask', {
     message:
       'Credential mode "mask" is not supported yet. Use "deny" to block the ' +
-      'credential inside the sandbox or "allow" to pass it through unchanged; ' +
-      'masking will be added in a future release.',
+      'credential inside the sandbox, or omit the entry to leave it ' +
+      'unrestricted; masking will be added in a future release.',
   })
 
 /**
@@ -171,9 +169,8 @@ export const CredentialEnvVarConfigSchema = z.object({
  * per-source mode:
  * - `deny` blocks the source inside the sandbox (file reads are denied via the
  *   filesystem read-deny mechanism, env vars are unset in the child).
- * - `allow` is currently a no-op — there are no default credential
- *   protections to exempt from. It is reserved for future semantics and
- *   never overrides an explicit filesystem.denyRead or `mode: "deny"` entry.
+ *
+ * Additional modes (e.g. `mask`) will be added in future releases.
  *
  * Only the sources declared here are affected; the section applies no
  * implicit restrictions beyond them.

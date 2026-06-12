@@ -7,7 +7,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from 'node:fs'
-import { homedir, tmpdir } from 'node:os'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
@@ -17,12 +17,11 @@ import { loadConfig } from '../../src/utils/config-loader.js'
 import { isLinux, isMacOS, isSupportedPlatform } from '../helpers/platform.js'
 
 /**
- * Tests for the `credentials` config section (mode: deny / allow).
+ * Tests for the `credentials` config section (mode: deny).
  *
  * File entries with mode: deny are unioned into the read-deny set; env var
  * entries with mode: deny are unset inside the sandbox. Only explicitly
- * declared sources are restricted — the block applies no implicit defaults,
- * and mode: allow is currently a no-op reserved for future semantics.
+ * declared sources are restricted — the block applies no implicit defaults.
  */
 
 function baseConfig(
@@ -97,47 +96,6 @@ describe.if(isSupportedPlatform)(
       // Caller denyRead survives and the credential deny entry is added
       expect(readConfig.denyOnly).toContain('/some/secret')
       expect(readConfig.denyOnly).toContain('~/.config/gcloud')
-
-      await SandboxManager.reset()
-    })
-
-    it('mode: allow entries add no read-deny', async () => {
-      await SandboxManager.reset()
-      await SandboxManager.initialize(
-        baseConfig({
-          credentials: {
-            files: [
-              { path: join(homedir(), '.aws'), mode: 'allow' },
-              { path: '~/.netrc', mode: 'deny' },
-            ],
-          },
-        }),
-      )
-
-      const readConfig = SandboxManager.getFsReadConfig()
-      // Only the deny entry lands in the read-deny set; allow is a no-op.
-      expect(readConfig.denyOnly).toEqual(['~/.netrc'])
-
-      await SandboxManager.reset()
-    })
-
-    it('mode: allow does not override caller-supplied denyRead for the same path', async () => {
-      await SandboxManager.reset()
-      await SandboxManager.initialize(
-        baseConfig({
-          filesystem: {
-            denyRead: ['~/.aws'],
-            allowWrite: ['/tmp'],
-            denyWrite: [],
-          },
-          credentials: {
-            files: [{ path: '~/.aws', mode: 'allow' }],
-          },
-        }),
-      )
-
-      const readConfig = SandboxManager.getFsReadConfig()
-      expect(readConfig.denyOnly).toContain('~/.aws')
 
       await SandboxManager.reset()
     })

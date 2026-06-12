@@ -433,8 +433,8 @@ function checkDependencies(ripgrepConfig?: {
  *
  * Only explicitly declared sources are restricted: `mode: 'deny'` file
  * entries join the read-deny set and `mode: 'deny'` env vars are unset.
- * `mode: 'allow'` entries currently add no restriction and exempt nothing —
- * the mode is reserved for future default-protection/masking semantics.
+ * The mode filter keeps the structure ready for future non-deny modes
+ * (e.g. masking).
  */
 function getCredentialRestrictions(
   credentials: CredentialsConfig | undefined,
