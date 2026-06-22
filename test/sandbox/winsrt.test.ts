@@ -14,6 +14,8 @@ import {
   installWindowsSandbox,
   uninstallWindowsSandbox,
   deleteWindowsGroup,
+  wrapCommandWithSandboxWindows,
+  parseWindowsBinShell,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
 } from '../../src/sandbox/windows-sandbox-utils.js'
 
@@ -208,6 +210,35 @@ async function bindFirstFree(candidates: number[]): Promise<BoundListener> {
   )
 }
 
+describe('parseWindowsBinShell (pure, all platforms)', () => {
+  it('maps tokens/paths and rejects the rest', () => {
+    expect(parseWindowsBinShell(undefined)).toEqual({ kind: 'cmd' })
+    expect(parseWindowsBinShell('cmd')).toEqual({ kind: 'cmd' })
+    expect(parseWindowsBinShell('pwsh')).toEqual({ kind: 'pwsh' })
+    expect(parseWindowsBinShell('PowerShell')).toEqual({ kind: 'powershell' })
+    for (const p of [
+      'C:\\Program Files\\Git\\bin\\bash.exe',
+      'C:\\Program Files\\Git\\usr\\bin\\bash.exe',
+      'C:\\Program Files\\Git\\bin\\sh.exe',
+    ]) {
+      expect(parseWindowsBinShell(p)).toEqual({ kind: 'bash', path: p })
+    }
+    // Bare/relative bash token: caller must pass the resolved absolute
+    // install path (PATH-resolved 'bash' could be WSL, not Git Bash).
+    expect(() => parseWindowsBinShell('bash')).toThrow(/absolute/)
+    // Unknown values fail loud rather than silently routing to cmd.exe.
+    expect(() => parseWindowsBinShell('zsh')).toThrow(/unrecognised binShell/)
+    expect(() =>
+      parseWindowsBinShell('C:\\Program Files\\Git\\git-bash.exe'),
+    ).toThrow(/unrecognised binShell/)
+    // An absolute path to pwsh/cmd is NOT a token — reject rather than
+    // silently dropping the caller's path and degrading to PATH lookup.
+    expect(() =>
+      parseWindowsBinShell('C:\\Program Files\\PowerShell\\7\\pwsh.exe'),
+    ).toThrow(/unrecognised binShell/)
+  })
+})
+
 describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
   it('getSrtWinPath resolves to an existing binary', () => {
     const p = getSrtWinPath()
@@ -226,6 +257,23 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
   it('getWindowsGroupStatus reports a non-existent SID as absent', () => {
     const gs = getWindowsGroupStatus({ groupSid: 'S-1-5-32-9999' })
     expect(gs.state).toBe('absent')
+  })
+
+  it('wrapCommandWithSandboxWindows: binShell={kind:bash} → [path, -c, cmd] (not cmd.exe)', () => {
+    // The bash arm treats binShell.path as the literal exe to invoke
+    // (Git Bash has no fixed install path). The command string — bash
+    // metachars and all — must land as the single argv element after
+    // `-c`, untouched.
+    const cmd = `echo 'a b' && printf '%s' x | cat`
+    const bashPath = 'C:\\Program Files\\Git\\bin\\bash.exe'
+    const { argv } = wrapCommandWithSandboxWindows({
+      command: cmd,
+      group: { groupSid: ADMINS_SID },
+      binShell: { kind: 'bash', path: bashPath },
+    })
+    expect(argv.slice(-3)).toEqual([bashPath, '-c', cmd])
+    expect(argv).not.toContain('/c')
+    expect(argv.join(' ')).not.toMatch(/cmd\.exe/i)
   })
 
   it('getWindowsWfpStatus reports absent for a never-installed sublayer', () => {
@@ -746,6 +794,56 @@ describe.if(isWindows)('Windows sandbox: SandboxManager network', () => {
       }
     },
     120_000,
+  )
+
+  it.skipIf(!existsSync(GIT_BASH))(
+    'E4: binShell=bash.exe — direct egress BLOCKED (WFP applies under bash inner shell)',
+    async () => {
+      // E1/E2 wrap git-bash inside `cmd /c "…bash.exe" -c …`. This row
+      // exercises the first-class bash inner-shell branch: srt-win
+      // spawns bash.exe DIRECTLY under the restricted token. The
+      // --noproxy strip forces a direct connect; WFP filter-3 must
+      // refuse it exactly as it does for cmd (cf. C4).
+      SandboxManager.updateConfig(createTestConfig(['example.com']))
+      const cmd = `curl --noproxy '*' -sS -m 5 https://example.com`
+      const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
+        cmd,
+        GIT_BASH,
+      )
+      // Sanity: routed via the bash branch, not cmd.
+      expect(argv.slice(-3)).toEqual([GIT_BASH, '-c', cmd])
+      const r = await spawnAsync(argv[0], argv.slice(1), {
+        timeout: 20_000,
+        env,
+      })
+      expectEgressBlocked('E4', r)
+    },
+    30_000,
+  )
+
+  it.skipIf(!existsSync(GIT_BASH))(
+    'E5: binShell=bash.exe — &&, single-quote, pipe survive argv round-trip',
+    async () => {
+      // Proves bash — not cmd — evaluates the command: `printf` is a
+      // bash builtin (cmd has no `printf`), single-quotes are bash
+      // quoting (cmd would emit them literally), and `|`/`&&` chain
+      // under bash semantics. srt-win's build_cmdline takes the
+      // generic MSVCRT-quote path for non-cmd targets, so the whole
+      // string reaches bash as one argv[2].
+      const cmd = `printf '%s ' one && printf '%s' two | tr a-z A-Z`
+      const { argv, env } = await SandboxManager.wrapWithSandboxArgv(
+        cmd,
+        GIT_BASH,
+      )
+      expect(argv.slice(-3)).toEqual([GIT_BASH, '-c', cmd])
+      const r = await spawnAsync(argv[0], argv.slice(1), {
+        timeout: 20_000,
+        env,
+      })
+      expectStatus('E5', r, [0])
+      expect(r.stdout.trim()).toBe('one TWO')
+    },
+    30_000,
   )
 
   it.skipIf(!existsSync(MSYS2_WGET))(

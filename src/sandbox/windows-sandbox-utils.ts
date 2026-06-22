@@ -62,6 +62,76 @@ export interface WindowsWfpStatusResult {
   portRange?: [number, number]
 }
 
+/**
+ * Inner shell to run `command` under, inside the restricted-token
+ * sandbox. The discriminant picks both the executable and the flag
+ * shape (`/c` vs `-Command` vs `-c`); see
+ * {@link wrapCommandWithSandboxWindows}.
+ *
+ * For `kind: 'bash'`, `path` is the absolute Git Bash executable
+ * (no fixed install location). It MUST originate from trusted host
+ * configuration (user settings / install detection), NEVER from
+ * workspace or repository content — the inner shell runs INSIDE the
+ * restricted-token sandbox so an unexpected path is not a
+ * sandbox-escape vector, but it would still be an arbitrary-exec
+ * footgun if sourced from untrusted input.
+ */
+export type WindowsBinShell =
+  | { kind: 'cmd' }
+  | { kind: 'powershell' }
+  | { kind: 'pwsh' }
+  | { kind: 'bash'; path: string }
+
+/**
+ * Adapter from the cross-platform `binShell?: string` surface
+ * ({@link SandboxManager.wrapWithSandboxArgv}) to the Windows
+ * discriminated union. Throws on any value outside the recognised
+ * set — there is no silent fallback to cmd.exe.
+ *
+ * Uses `path.win32` explicitly so the function (and its unit test)
+ * is platform-independent.
+ */
+export function parseWindowsBinShell(raw?: string): WindowsBinShell {
+  if (raw === undefined) return { kind: 'cmd' }
+  // bash/sh: path semantics — match on basename, keep the caller's
+  // absolute path verbatim.
+  const base = path.win32.basename(raw).toLowerCase()
+  if (
+    base === 'bash' ||
+    base === 'bash.exe' ||
+    base === 'sh' ||
+    base === 'sh.exe'
+  ) {
+    if (!path.win32.isAbsolute(raw)) {
+      throw new Error(
+        `binShell bash path must be absolute (got ${JSON.stringify(raw)}); ` +
+          `pass the resolved Git Bash install path`,
+      )
+    }
+    return { kind: 'bash', path: raw }
+  }
+  // cmd/powershell/pwsh: token semantics — match on the FULL string,
+  // not basename, so an absolute path to pwsh.exe (whose path we'd
+  // otherwise discard) falls through to the explicit throw rather
+  // than silently degrading to a PATH lookup.
+  switch (raw.toLowerCase()) {
+    case 'pwsh':
+    case 'pwsh.exe':
+      return { kind: 'pwsh' }
+    case 'powershell':
+    case 'powershell.exe':
+      return { kind: 'powershell' }
+    case 'cmd':
+    case 'cmd.exe':
+      return { kind: 'cmd' }
+    default:
+      throw new Error(
+        `unrecognised binShell ${JSON.stringify(raw)}: expected ` +
+          `'cmd' | 'powershell' | 'pwsh' or an absolute path to bash.exe/sh.exe`,
+      )
+  }
+}
+
 export interface WindowsSandboxParams {
   command: string
   group: WindowsGroupRef
@@ -72,13 +142,15 @@ export interface WindowsSandboxParams {
   /** Per-session proxy auth token; embedded in proxy env URLs. */
   proxyAuthToken?: string
   /**
-   * Inner shell. `cmd` (default), `powershell`, or `pwsh`. The child's
-   * post-`/c` content is **passthrough** — `&` chains, `"…"` quotes
-   * exactly as written. The security boundary is at the OUTER spawn
-   * (this argv is spawned with `shell:false`); the inner cmd.exe runs
-   * INSIDE the sandbox so its metachars are the user's tool.
+   * Inner shell. Defaults to `{ kind: 'cmd' }`. The child's post-`/c`
+   * (or `-Command` / `-c`) content is **passthrough** — `&` chains,
+   * `"…"`/`'…'` quotes exactly as written. The security boundary is at
+   * the OUTER spawn (this argv is spawned with `shell:false`); the
+   * inner shell runs INSIDE the sandbox so its metachars are the
+   * user's tool. See {@link parseWindowsBinShell} for the
+   * cross-platform string adapter.
    */
-  binShell?: string
+  binShell?: WindowsBinShell
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -462,31 +534,49 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   argv.push('--')
 
   const systemRoot = process.env.SystemRoot ?? 'C:\\Windows'
-  const shell = (p.binShell ?? 'cmd').toLowerCase()
-  if (shell === 'pwsh' || shell.includes('powershell')) {
-    const psExe =
-      shell === 'pwsh'
-        ? 'pwsh.exe'
-        : path.join(
-            systemRoot,
-            'System32',
-            'WindowsPowerShell',
-            'v1.0',
-            'powershell.exe',
-          )
-    argv.push(psExe, '-NoProfile', '-Command', p.command)
-  } else {
-    // cmd /d (no AutoRun) /s (strip first+last quote of post-/c by
-    // position) /c (run-then-exit). The `command` string lands as a
-    // single argv element; srt-win's build_cmdline wraps it in one
-    // outer "…" pair for /s to consume. See launch.rs.
-    argv.push(
-      path.join(systemRoot, 'System32', 'cmd.exe'),
-      '/d',
-      '/s',
-      '/c',
-      p.command,
-    )
+  const sh = p.binShell ?? { kind: 'cmd' }
+  switch (sh.kind) {
+    case 'bash':
+      // Git Bash: invoke the caller-supplied path directly with
+      // `-c <command>`. `command` is a fully-assembled bash command
+      // string with its own internal quoting; srt-win's `build_cmdline`
+      // takes the generic non-cmd branch and MSVCRT-quotes it as a
+      // SINGLE argv element, so bash receives it intact as argv[2].
+      // TODO: MSYS2 derives POSIX /tmp from Windows TEMP/TMP itself;
+      // revisit whether any extra TEMP/TMP normalisation is needed for
+      // the bash inner shell under the restricted token.
+      argv.push(sh.path, '-c', p.command)
+      break
+    case 'pwsh':
+      argv.push('pwsh.exe', '-NoProfile', '-Command', p.command)
+      break
+    case 'powershell':
+      argv.push(
+        path.join(
+          systemRoot,
+          'System32',
+          'WindowsPowerShell',
+          'v1.0',
+          'powershell.exe',
+        ),
+        '-NoProfile',
+        '-Command',
+        p.command,
+      )
+      break
+    case 'cmd':
+      // cmd /d (no AutoRun) /s (strip first+last quote of post-/c by
+      // position) /c (run-then-exit). The `command` string lands as a
+      // single argv element; srt-win's build_cmdline wraps it in one
+      // outer "…" pair for /s to consume. See launch.rs.
+      argv.push(
+        path.join(systemRoot, 'System32', 'cmd.exe'),
+        '/d',
+        '/s',
+        '/c',
+        p.command,
+      )
+      break
   }
 
   // Generated proxy vars override any inherited ones so the child
