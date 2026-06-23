@@ -339,20 +339,26 @@ pub fn run(spec: &ExecSpec<'_>) -> Result<u32> {
 fn build_env_block() -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
 
-    // Lossless base set — `env::vars()` silently SKIPS any entry
-    // whose key or value is not valid UTF-8 (e.g. a PATH segment
-    // with an unpaired surrogate from a profile path). Build from
+    // Lossless base set — `env::vars()` PANICS on any entry whose
+    // key or value is not valid UTF-8 (e.g. a PATH segment with an
+    // unpaired surrogate from a profile path). Build from
     // `vars_os()` and encode each via `encode_wide` so nothing is
-    // dropped.
+    // dropped and nothing panics.
     let mut entries: Vec<(std::ffi::OsString, std::ffi::OsString)> =
         std::env::vars_os().collect();
 
     // Proxy case-twin repair operates on the UTF-8-decodable
-    // subset (proxy variable names/values are ASCII by
-    // convention, so nothing relevant is missed). The helper
-    // only APPENDS twins; pick those up and add them to the
-    // OsString set.
-    let mut twin_view: Vec<(String, String)> = std::env::vars().collect();
+    // subset: proxy variable NAMES are ASCII by convention so
+    // filtering to entries whose key round-trips as UTF-8 misses
+    // nothing relevant; values are passed through lossily (the
+    // helper only inspects names, never values). Built from
+    // `vars_os()` for the same panic-avoidance reason — `vars()`
+    // panics on ANY non-UTF-8 entry, not just the one being read.
+    let mut twin_view: Vec<(String, String)> = std::env::vars_os()
+        .filter_map(|(k, v)| {
+            Some((k.into_string().ok()?, v.to_string_lossy().into_owned()))
+        })
+        .collect();
     let before = twin_view.len();
     add_proxy_case_twins(&mut twin_view);
     for (k, v) in twin_view.into_iter().skip(before) {

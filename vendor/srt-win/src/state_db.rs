@@ -655,7 +655,12 @@ impl Locked {
             Option<AclMask>,
             MarkerHash,
         ) = match class {
-            StampClass::StampedUnrecognized => {
+            // Any marker-bearing class on a FILE that isn't
+            // File(_, _) is shape drift (a parent-shape DACL on a
+            // file is something we never write). Same fail-closed
+            // route as StampedUnrecognized — never original_sd=cur.
+            StampClass::StampedUnrecognized
+            | StampClass::ParentAllowList(_) => {
                 bail!(
                     "'{canon}': on-disk DACL is a derivative of a broker \
                      stamp (marker stripped, shape drifted, or foreign \
@@ -665,7 +670,7 @@ impl Locked {
                      original back if you trust the DB row."
                 );
             }
-            StampClass::Unstamped | StampClass::ParentAllowList(_) => {
+            StampClass::Unstamped => {
                 let h = acl::compute_marker_hash(&cur, &cur_id);
                 (Some(cur), want_mask, None, h)
             }
@@ -846,7 +851,12 @@ impl Locked {
                     (None, h, true)
                 }
             },
-            StampClass::StampedUnrecognized => {
+            // Any marker-bearing class on a DIRECTORY that isn't
+            // ParentAllowList(_) is shape drift (a file-shape
+            // DACL on a dir is something we never write). Same
+            // fail-closed route as StampedUnrecognized.
+            StampClass::StampedUnrecognized
+            | StampClass::File(_, _) => {
                 eprintln!(
                     "srt-win: parent '{parent}': broker-stamp derivative \
                      (stamped_unrecognized); routing children to handle \
@@ -854,7 +864,7 @@ impl Locked {
                 );
                 return Ok(ParentState::Unstampable);
             }
-            _ => {
+            StampClass::Unstamped => {
                 let h = acl::compute_marker_hash(&cur, &cur_id);
                 (Some(cur), h, false)
             }
@@ -1456,16 +1466,29 @@ fn verify_and_restore(
     };
     let class = acl::classify_sd(&cur, calib)?;
 
-    // "Ours" = the stamp shape this caller writes; the other
-    // shape routes to the Unstamped arm.
-    let ours_h = match (kind, &class) {
+    // "Ours" = the stamp shape this caller writes; the OTHER
+    // marker-bearing shape (parent shape on a file or vice
+    // versa) is shape drift → StampedUnrecognized, same as
+    // ensure_stamped — the marker can't be corroborated against
+    // this row.
+    enum Ours {
+        Match(MarkerHash),
+        CrossShape,
+        Foreign,
+    }
+    let ours = match (kind, &class) {
         (RestoreKind::File, StampClass::File(_, h))
-        | (RestoreKind::Parent, StampClass::ParentAllowList(h)) => Some(*h),
-        _ => None,
+        | (RestoreKind::Parent, StampClass::ParentAllowList(h)) => {
+            Ours::Match(*h)
+        }
+        (RestoreKind::File, StampClass::ParentAllowList(_))
+        | (RestoreKind::Parent, StampClass::File(_, _)) => Ours::CrossShape,
+        (_, StampClass::StampedUnrecognized) => Ours::CrossShape,
+        (_, StampClass::Unstamped) => Ours::Foreign,
     };
 
-    Ok(match (ours_h, &class) {
-        (None, StampClass::StampedUnrecognized) => {
+    Ok(match ours {
+        Ours::CrossShape => {
             if force {
                 force_out("StampedUnrecognized")
             } else {
@@ -1478,8 +1501,8 @@ fn verify_and_restore(
                 RestoreVerdict::StampedUnrecognized
             }
         }
-        // Not our stamp shape on disk → treat as third-party state.
-        (None, _) => match original_sd {
+        // No broker shape on disk → treat as third-party state.
+        Ours::Foreign => match original_sd {
             Some(orig) if cur.equiv(orig) => RestoreVerdict::AlreadyOriginal,
             Some(orig) if force => do_write(orig),
             Some(_) => {
@@ -1493,7 +1516,7 @@ fn verify_and_restore(
             None => RestoreVerdict::AlreadyOriginal,
         },
         // Our stamp shape on disk → corroborate row against marker.
-        (Some(h), _) => match original_sd {
+        Ours::Match(h) => match original_sd {
             None if force => force_out("OriginalLost"),
             None => {
                 eprintln!(
@@ -1635,10 +1658,8 @@ fn try_restore_parent_validated(
     // onto somebody else's new directory.
     let stored_id = match p.file_id {
         Some(id) => id,
-        // Pre-file_id legacy row: no identity check possible.
-        // Treat as match so the SD ladder still validates the
-        // marker; conservative since the marker hash is bound to
-        // file_id.
+        // Pre-file_id legacy row: identity gate and marker
+        // corroboration both need it; fail closed.
         None => {
             return Ok(Some(ParentRestoreOutcome::Failed(
                 "no recorded file_id".into(),
@@ -1670,7 +1691,15 @@ fn try_restore_parent_validated(
         &dacls.calib,
         force,
     )?;
-    if v.row_done() {
+    // Drop the row only when the directory's DACL was actually
+    // returned to a non-broker state. `OriginalLost` (even under
+    // `--force`) leaves the dir broker-stamped on disk — keeping
+    // the row preserves the only pointer the user has to which
+    // directories still need a manual `icacls /reset`.
+    if matches!(
+        v,
+        RestoreVerdict::Restored | RestoreVerdict::AlreadyOriginal
+    ) {
         conn.execute(
             "DELETE FROM parent_stamps WHERE canonical_parent_path = ?1",
             params![parent],
@@ -1688,9 +1717,6 @@ fn try_restore_parent_validated(
         }
         RestoreVerdict::Tampered => {
             ParentRestoreOutcome::Failed("original_sd_tampered".into())
-        }
-        RestoreVerdict::OriginalLost { force_dropped: true } => {
-            ParentRestoreOutcome::Restored
         }
         RestoreVerdict::OriginalLost { .. } => {
             ParentRestoreOutcome::Failed("original_sd_lost".into())

@@ -1180,23 +1180,47 @@ try {
     # ── H8: crash-between-upsert-and-stamp ──────────────────────
     # Row exists with original_sd=O, file UNSTAMPED. Next
     # ensure_stamped: classify→Unstamped, original_sd=cur,
-    # upsert overwrites — no error, file gets stamped.
+    # upsert overwrites — no error, file gets stamped, and the
+    # action is Fresh (NOT AlreadyStamped — that would mean the
+    # row was trusted without checking disk).
     $h8 = Join-Path $Scratch 'h8.txt'
     Set-Content -Path $h8 -Value 'H8' -NoNewline
     $h8Orig = (Get-Acl -LiteralPath $h8).GetSecurityDescriptorBinaryForm()
     $h8Hex = ($h8Orig | ForEach-Object { $_.ToString('x2') }) -join ''
     $h8FileId = ([SrtWinSmoke.FileId]::Get($h8) |
       ForEach-Object { $_.ToString('x2') }) -join ''
+    # SQLite string literals do NOT use backslash escaping (only
+    # '' for embedded single-quote), so the canonical \\?\… path
+    # goes in verbatim. The previous `-replace '\\','\\'` doubled
+    # every backslash and the seeded row never matched the real
+    # canon — the test passed vacuously as a fresh stamp.
+    $h8Canon = "\\?\$h8"
     & $sqlite $stateDb ("INSERT INTO acl_snapshots " +
       "(canonical_path, original_sd, file_id, parent_path, " +
       "parent_stamp_failed) VALUES " +
-      "('\\?\' || '$($h8 -replace '\\','\\')', " +
-      "X'$h8Hex', X'$h8FileId', NULL, 1)") 2>$null
-    # The path quoting above is fiddly; if the insert failed it's
-    # not load-bearing — the row may simply not exist, in which
-    # case this degenerates to a normal first-stamp. Either way
-    # the assertion below holds.
-    Stamp @{ denyRead = @($h8) }
+      "('$($h8Canon -replace "'","''")', " +
+      "X'$h8Hex', X'$h8FileId', NULL, 1)")
+    if ($LASTEXITCODE -ne 0) { throw "H8: sqlite3 seed failed" }
+    # Verify the seed actually matches what srt-win will key on.
+    $h8Got = & $sqlite $stateDb `
+      "SELECT count(*) FROM acl_snapshots WHERE canonical_path LIKE '%\h8.txt'"
+    if ($h8Got -ne '1') {
+      throw "H8 setup: seeded row not found by canonical key " +
+            "(got count=$h8Got for canon='$h8Canon')"
+    }
+    $r8 = @{ denyRead = @($h8) } | ConvertTo-Json -Compress |
+      & $Exe acl stamp --group-sid $GroupSid --holder-pid $Holder 2>&1 |
+      Out-String
+    Write-Host -NoNewline $r8
+    if ($LASTEXITCODE -ne 0) {
+      throw "H8: stamp over a row-but-unstamped file FAILED " +
+            "(should re-derive original_sd=cur and overwrite). out: $r8"
+    }
+    if ($r8 -notmatch '1 newly stamped' -or
+        $r8 -match '[1-9]\d* already held') {
+      throw "H8: expected 1 newly stamped, 0 already held " +
+            "(disk-first must NOT trust the seeded row); got: $r8"
+    }
     if (-not (Get-MarkerHash $h8)) {
       throw "H8: file not stamped after a row-but-unstamped state"
     }
