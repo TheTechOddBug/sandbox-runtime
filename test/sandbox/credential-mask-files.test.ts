@@ -1,4 +1,5 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
+import { spawnSync } from 'node:child_process'
 import {
   existsSync,
   mkdirSync,
@@ -18,6 +19,9 @@ import {
   SentinelRegistry,
   SENTINEL_PREFIX,
 } from '../../src/sandbox/credential-sentinel.js'
+import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
+import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
+import { isLinux } from '../helpers/platform.js'
 
 /**
  * Unit tests for the fake-file store and bind builder. Platform-agnostic;
@@ -184,5 +188,148 @@ describe('buildMaskedFileBinds', () => {
     )
     expect(binds).toHaveLength(0)
     store.dispose()
+  })
+})
+
+/**
+ * SandboxManager-level file masking on Linux: bwrap binds the fake over
+ * the real path; the sandboxed process reads the sentinel; the real bytes
+ * never appear in the wrapped command string.
+ */
+describe.if(isLinux)('file masking on Linux (bwrap)', () => {
+  const TEST_DIR = join(tmpdir(), 'srt-credmask-linux-' + Date.now())
+  const SECRET_FILE = join(TEST_DIR, 'token')
+  const SECRET_CONTENT = 'ghp_linux_real_secret_0123456789'
+  const CONTROL_FILE = join(TEST_DIR, 'control.txt')
+
+  function baseConfig(
+    overrides: Partial<SandboxRuntimeConfig> = {},
+  ): SandboxRuntimeConfig {
+    return {
+      network: { allowedDomains: ['localhost'], deniedDomains: [] },
+      filesystem: {
+        denyRead: [],
+        allowWrite: [TEST_DIR, '/tmp'],
+        denyWrite: [],
+      },
+      credentials: {
+        files: [{ path: SECRET_FILE, mode: 'mask' }],
+        allowPlaintextInject: true,
+      },
+      ...overrides,
+    }
+  }
+
+  function runInSandbox(wrappedCommand: string) {
+    return spawnSync(wrappedCommand, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+  }
+
+  beforeAll(async () => {
+    mkdirSync(TEST_DIR, { recursive: true })
+    writeFileSync(SECRET_FILE, SECRET_CONTENT)
+    writeFileSync(CONTROL_FILE, 'control-ok')
+    await SandboxManager.reset()
+    await SandboxManager.initialize(baseConfig())
+  })
+
+  afterAll(async () => {
+    await SandboxManager.reset()
+    rmSync(TEST_DIR, { recursive: true, force: true })
+  })
+
+  describe('bwrap argv generation', () => {
+    test('emits --ro-bind <fake> <real> with the sentinel as fake content', async () => {
+      const wrapped = await SandboxManager.wrapWithSandbox('true')
+      const m = wrapped.match(
+        new RegExp(`--ro-bind (\\S+) ${SECRET_FILE.replace(/\//g, '\\/')}\\b`),
+      )
+      expect(m).not.toBeNull()
+      const fakePath = m![1]!
+      expect(fakePath).not.toBe('/dev/null')
+      const fakeContent = readFileSync(fakePath, 'utf8')
+      expect(fakeContent.startsWith(SENTINEL_PREFIX)).toBe(true)
+      // The registry maps that sentinel back to the real bytes.
+      expect(SandboxManager.getSentinelRegistry().lookupReal(fakeContent)).toBe(
+        SECRET_CONTENT,
+      )
+    })
+
+    test('the real file content never appears in the wrapped command', async () => {
+      const wrapped = await SandboxManager.wrapWithSandbox('true')
+      expect(wrapped).not.toContain(SECRET_CONTENT)
+    })
+
+    test('a masked file that does not exist on the host emits no bind', async () => {
+      await SandboxManager.reset()
+      await SandboxManager.initialize(
+        baseConfig({
+          credentials: {
+            files: [{ path: join(TEST_DIR, 'no-such-token'), mode: 'mask' }],
+            allowPlaintextInject: true,
+          },
+        }),
+      )
+      const wrapped = await SandboxManager.wrapWithSandbox('true')
+      expect(wrapped).not.toContain('no-such-token')
+
+      // Restore for the remaining tests.
+      await SandboxManager.reset()
+      await SandboxManager.initialize(baseConfig())
+    })
+
+    test('repeat wraps reuse the same fake file (no per-call leak)', async () => {
+      await SandboxManager.wrapWithSandbox('true')
+      await SandboxManager.wrapWithSandbox('true')
+      const dir = SandboxManager.getMaskedFileStore().dirPath!
+      expect(readdirSync(dir)).toHaveLength(1)
+    })
+  })
+
+  describe('integration', () => {
+    test('cat <maskedFile> inside the sandbox returns the sentinel', async () => {
+      const wrapped = await SandboxManager.wrapWithSandbox(`cat ${SECRET_FILE}`)
+      const result = runInSandbox(wrapped)
+      expect(result.status).toBe(0)
+      expect(result.stdout.startsWith(SENTINEL_PREFIX)).toBe(true)
+      expect(result.stdout).not.toContain(SECRET_CONTENT)
+    })
+
+    test('the masked file is read-only inside the sandbox', async () => {
+      // Even though TEST_DIR is in allowWrite, the --ro-bind on the
+      // masked path layers on top — overwriting it would expose a way
+      // to swap the sentinel for something the proxy might still inject.
+      const wrapped = await SandboxManager.wrapWithSandbox(
+        `sh -c 'echo pwned > ${SECRET_FILE}'`,
+      )
+      const result = runInSandbox(wrapped)
+      expect(result.status).not.toBe(0)
+      // Real file on the host is untouched.
+      expect(readFileSync(SECRET_FILE, 'utf8')).toBe(SECRET_CONTENT)
+    })
+
+    test('a non-masked sibling file is still readable unchanged', async () => {
+      const wrapped = await SandboxManager.wrapWithSandbox(
+        `cat ${CONTROL_FILE}`,
+      )
+      const result = runInSandbox(wrapped)
+      expect(result.status).toBe(0)
+      expect(result.stdout).toBe('control-ok')
+    })
+  })
+
+  test('reset() removes the fake-file temp dir', async () => {
+    await SandboxManager.wrapWithSandbox('true')
+    const dir = SandboxManager.getMaskedFileStore().dirPath
+    expect(dir).toBeDefined()
+    expect(existsSync(dir!)).toBe(true)
+    await SandboxManager.reset()
+    expect(existsSync(dir!)).toBe(false)
+    expect(SandboxManager.getMaskedFileStore().dirPath).toBeUndefined()
+    // Re-initialize for any following tests.
+    await SandboxManager.initialize(baseConfig())
   })
 })
