@@ -39,6 +39,7 @@ import {
 import {
   checkWindowsDependencies,
   wrapCommandWithSandboxWindows,
+  parseWindowsBinShell,
   DEFAULT_WINDOWS_GROUP_NAME,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
   type WindowsGroupRef,
@@ -1063,10 +1064,11 @@ async function wrapWithSandboxArgv(
     return wrapCommandWithSandboxWindows({
       command,
       group: getWindowsGroupRef(),
+      sublayerGuid: config?.windows?.wfpSublayerGuid,
       httpProxyPort: hasNetworkConfig ? getProxyPort() : undefined,
       socksProxyPort: hasNetworkConfig ? getSocksProxyPort() : undefined,
       proxyAuthToken: hasNetworkConfig ? proxyAuthToken : undefined,
-      binShell,
+      binShell: parseWindowsBinShell(binShell),
     })
   }
 
