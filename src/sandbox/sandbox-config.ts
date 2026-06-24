@@ -186,9 +186,9 @@ const extractPatternSchema = z.string().superRefine((val, ctx) => {
  * sentinels — the rest of the file is preserved byte-for-byte. This lets a
  * tool that parses the file (`.netrc`, JSON/YAML configs) still succeed
  * inside the sandbox while the credential values are protected. If the
- * regex matches nothing the entry **degrades to `mode: "deny"`** at
- * runtime: a wrong pattern fails closed rather than leaving the real
- * credential readable.
+ * regex matches nothing, a warning is emitted to stderr and the file is
+ * left readable as-is (unprotected) — fix the regex or remove the entry.
+ * A future option may make this behaviour configurable.
  *
  * On macOS, SBPL cannot redirect reads, so `mode: "mask"` (with or without
  * `extract`) currently degrades to `mode: "deny"` (the file is unreadable
@@ -205,7 +205,9 @@ export const CredentialFileConfigSchema = z.object({
     .describe(
       'Optional regex for structured masking. Applied globally; capture ' +
         'group 1 of each match is masked, the rest of the file is preserved. ' +
-        'If the regex matches nothing the entry degrades to mode "deny". ' +
+        'If the pattern matches nothing in the file, a warning is emitted ' +
+        'and the file is left readable as-is (unprotected) — fix the regex ' +
+        'or remove the entry. A future option may make this configurable. ' +
         'Only meaningful when mode is "mask"; accepted but ignored for "deny".',
     ),
   injectHosts: z
