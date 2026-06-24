@@ -3,7 +3,18 @@ import * as path from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 import { logForDebugging } from '../utils/debug.js'
-import { generateProxyEnvVars } from './sandbox-utils.js'
+import {
+  containsGlobCharsWin,
+  expandGlobPattern,
+  generateProxyEnvVars,
+  normalizePathForSandbox,
+} from './sandbox-utils.js'
+// Re-export so existing tests (glob-expand.test.ts) and any
+// out-of-tree caller keep their import path.
+export {
+  containsGlobCharsWin,
+  stripExtendedPathPrefix,
+} from './sandbox-utils.js'
 import type { SandboxDependencyCheck } from './linux-sandbox-utils.js'
 
 /**
@@ -21,7 +32,12 @@ import type { SandboxDependencyCheck } from './linux-sandbox-utils.js'
  * token-membership check; WFP via providerData-tag enumeration under
  * the configured sublayer). There is no marker file.
  *
- * Filesystem restrictions are NOT enforced on Windows yet.
+ * Filesystem deny (`denyRead`/`denyWrite`) is enforced via
+ * `srt-win acl stamp` at session start: a broker-only DACL is
+ * applied to each listed file plus a `Modify`-minus-`FILE_DELETE_CHILD`
+ * allow-list on its immediate parent directory, with restore state
+ * sealed by an inert hash-ACE marker so the on-disk SD is
+ * self-authenticating. See {@link stampWindowsAcl}.
  */
 
 // ────────────────────────────────────────────────────────────────────
@@ -150,6 +166,30 @@ export interface WindowsSandboxParams {
   /** Per-session proxy auth token; embedded in proxy env URLs. */
   proxyAuthToken?: string
   /**
+   * Credential env vars to drop from the inherited environment
+   * (`mode: 'deny'`). Applied BEFORE the proxy assignments so the
+   * sandbox's own proxy plumbing survives even if a caller lists
+   * one of those names here — same precedence as the macOS/Linux
+   * `env -u … VAR=… sandbox-exec` order.
+   */
+  unsetEnvVars?: readonly string[]
+  /**
+   * Credential env vars to overwrite with a sentinel
+   * (`mode: 'mask'`). Applied BEFORE the proxy assignments for the
+   * same precedence reason as {@link unsetEnvVars}.
+   */
+  setEnvVars?: Readonly<Record<string, string>>
+  /**
+   * PID of the long-lived host whose `srt-win acl stamp` holds
+   * this exec should run under. When set, `srt-win exec` opens a
+   * no-`FILE_SHARE_DELETE` handle on each of that holder's stamped
+   * directories and fenced files before spawning the child — the
+   * OS then refuses delete/rename of those, which the file's DACL
+   * alone cannot prevent. Omit for an exec with no file-deny
+   * session active.
+   */
+  holderPid?: number
+  /**
    * Inner shell. Defaults to `{ kind: 'cmd' }`. The child's post-`/c`
    * (or `-Command` / `-c`) content is **passthrough** — `&` chains,
    * `"…"`/`'…'` quotes exactly as written. The security boundary is at
@@ -240,9 +280,17 @@ interface RunResult {
   stderr: string
 }
 
-function runSrtWin(args: string[]): RunResult {
+function runSrtWin(
+  args: string[],
+  stdin?: string,
+  timeoutMs = 15_000,
+): RunResult {
   const exe = getSrtWinPath()
-  const r = spawnSync(exe, args, { encoding: 'utf8', timeout: 15_000 })
+  const r = spawnSync(exe, args, {
+    encoding: 'utf8',
+    timeout: timeoutMs,
+    ...(stdin !== undefined && { input: stdin }),
+  })
   if (r.error) {
     throw new Error(`srt-win ${args[0]}: spawn failed: ${r.error.message}`)
   }
@@ -253,8 +301,8 @@ function runSrtWin(args: string[]): RunResult {
   }
 }
 
-function runSrtWinJson<T>(args: string[]): T {
-  const r = runSrtWin(args)
+function runSrtWinJson<T>(args: string[], opts?: { timeoutMs?: number }): T {
+  const r = runSrtWin(args, undefined, opts?.timeoutMs)
   if (r.status !== 0) {
     throw new Error(
       `srt-win ${args.join(' ')} exited ${r.status}: ${r.stderr || r.stdout}`,
@@ -527,6 +575,216 @@ export function createWindowsWfp(
 }
 
 // ────────────────────────────────────────────────────────────────────
+// Filesystem deny (ACL stamp / restore)
+// ────────────────────────────────────────────────────────────────────
+
+/**
+ * Per-file outcome from `srt-win acl restore --json`. `status:
+ * "restored"` covers both `Restored` and `AlreadyOriginal` on the
+ * Rust side (the host doesn't need to distinguish them); every
+ * other status keeps the snapshot row (fail-closed) and is
+ * surfaced to the user as an anomaly to investigate. Mirrors
+ * `restore_entry()` in `vendor/srt-win-src/src/main.rs`.
+ */
+export interface WindowsAclPathOutcome {
+  path: string
+  status:
+    | 'restored'
+    | 'relocated'
+    | 'missing'
+    | 'leftChanged'
+    | 'leftUnreadable'
+    | 'originalSdTampered'
+    | 'originalSdLost'
+    | 'stampedUnrecognized'
+  /** Hex `FILE_ID_INFO` recorded at stamp time. Present when `status ≠ "restored"`. */
+  expectedFileId?: string
+  /** Where the protected file was found by `file_id`. Only on `relocated`. */
+  movedTo?: string
+  /** `true` whenever `status ≠ "restored"` — the snapshot row was kept (restore not confirmed). */
+  leftStamped?: boolean
+}
+
+/**
+ * Per-parent-directory outcome from `srt-win acl restore --json`.
+ * `stillHeld` is normal (another active session still references
+ * a file under this directory). Mirrors `parent_entries_from()` +
+ * `ParentRestoreOutcome::as_str()` in `vendor/srt-win-src/src/`.
+ */
+export interface WindowsAclParentOutcome {
+  path: string
+  status:
+    | 'restored'
+    | 'alreadyOriginal'
+    | 'stillHeld'
+    | 'leftChanged'
+    | 'missing'
+    | 'leftStamped'
+  /** Underlying error for `leftStamped`. */
+  error?: string
+}
+
+/** Top-level shape of `srt-win acl restore --json`. */
+export interface WindowsAclRestoreResult {
+  paths: WindowsAclPathOutcome[]
+  parents: WindowsAclParentOutcome[]
+}
+
+/**
+ * Expand the `denyRead`/`denyWrite` input set to a flat list of
+ * existing FILE paths for `srt-win acl stamp`.
+ *
+ * Every input goes through {@link normalizePathForSandbox} (the
+ * single Windows-aware chokepoint: `\\?\`/UNC-strip, drive-letter
+ * case-fold, ~-expand, realpath). Globs (`*`/`?` only — `[`/`]`
+ * are legal Win32 filename chars) expand via the shared walker
+ * with case-insensitive matching (point-in-time: a file appearing
+ * after this returns is NOT covered). Each candidate is checked
+ * with one `statSync({throwIfNoEntry:false})`: missing → drop
+ * (the protection model covers files present at session start);
+ * directory → reject (the file stamp applies a per-file DACL plus
+ * a per-parent-directory allow-list; stamping a directory itself
+ * would touch every child); file → keep.
+ */
+export function expandWindowsFsDenyPaths(
+  patterns: readonly string[],
+): string[] {
+  const out = new Set<string>()
+  for (const raw of patterns) {
+    const norm = normalizePathForSandbox(raw)
+    const candidates = containsGlobCharsWin(norm)
+      ? expandGlobPattern(norm, { caseInsensitive: true })
+      : [norm]
+    for (const c of candidates) {
+      const st = fs.statSync(c, { throwIfNoEntry: false })
+      if (!st) continue
+      if (st.isDirectory()) {
+        throw new Error(
+          `Windows fs deny requires explicit file paths; ` +
+            `${JSON.stringify(raw)} resolved to directory ` +
+            `${JSON.stringify(c)}. Directory targets are not supported.`,
+        )
+      }
+      out.add(c)
+    }
+  }
+  return [...out]
+}
+
+export interface WindowsAclStampOptions {
+  group: WindowsGroupRef
+  /** Files the sandboxed child must not read. */
+  denyRead: readonly string[]
+  /** Files the sandboxed child must not write (read stays allowed). */
+  denyWrite: readonly string[]
+  /** Long-lived host PID the holds are tied to. Default: this process. */
+  holderPid?: number
+}
+
+/**
+ * Apply the file-deny stamp set for one host session. Idempotent
+ * via `srt-win`'s disk-first `ensure_stamped` chokepoint — calling
+ * this again with overlapping paths re-verifies the on-disk DACL
+ * against the hash-ACE marker rather than trusting state-DB rows.
+ *
+ * Inputs are passed verbatim to `srt-win` (which canonicalizes,
+ * rejects directories and globs, and stamps each file plus its
+ * immediate parent directory). Callers that accept globs should
+ * pre-expand via {@link expandWindowsFsDenyPaths}.
+ *
+ * @throws on exit ≠ 0 — including exit 2 (one or more inputs
+ *   skipped). srt-win stamps the resolvable inputs before exiting
+ *   2, so on throw the caller should call {@link restoreWindowsAcl}
+ *   to release whatever WAS stamped (fail-closed at session start
+ *   means tearing down a partial setup).
+ */
+export function stampWindowsAcl(opts: WindowsAclStampOptions): void {
+  const holder = opts.holderPid ?? process.pid
+  const stdin = JSON.stringify({
+    denyRead: opts.denyRead,
+    denyWrite: opts.denyWrite,
+  })
+  const r = runSrtWin(
+    ['acl', 'stamp', ...groupRefArgs(opts.group), '--holder-pid', `${holder}`],
+    stdin,
+    60_000,
+  )
+  logForDebugging(
+    `[Sandbox Windows] acl stamp exit=${r.status}: ${r.stderr || r.stdout}`,
+  )
+  if (r.status !== 0) {
+    // exit 2 = partial (some inputs skipped); exit 1 = at least
+    // one path could not be stamped. Either is a setup failure.
+    throw new Error(
+      `srt-win acl stamp exited ${r.status} ` +
+        (r.status === 2 ? '(partial — some inputs skipped)' : '(failed)') +
+        `: ${r.stderr || r.stdout}`,
+    )
+  }
+}
+
+export interface WindowsAclRestoreOptions {
+  group: WindowsGroupRef
+  /** Long-lived host PID whose holds to release. Default: this process. */
+  holderPid?: number
+}
+
+/**
+ * Release this holder's file-deny stamps and return per-path /
+ * per-parent outcomes. Best-effort: a non-`restored` entry means
+ * the file's stamp was LEFT in place (fail-closed) — see
+ * {@link WindowsAclPathOutcome} for the cases. Does not throw on
+ * anomalies; the caller decides whether to surface them.
+ *
+ * Returns `undefined` when `srt-win acl restore` itself failed
+ * (no JSON to parse) — the caller should log and move on rather
+ * than block teardown.
+ */
+export function restoreWindowsAcl(
+  opts: WindowsAclRestoreOptions,
+): WindowsAclRestoreResult | undefined {
+  const holder = opts.holderPid ?? process.pid
+  const args = [
+    'acl',
+    'restore',
+    ...groupRefArgs(opts.group),
+    '--holder-pid',
+    `${holder}`,
+    '--json',
+  ]
+  // Don't let a teardown helper throw — the caller's reset() must
+  // complete. runSrtWinJson covers spawn-fail (ENOENT, AV-lock,
+  // timeout), non-zero exit, and unparseable output with a
+  // descriptive message; log it and return undefined.
+  try {
+    return runSrtWinJson<WindowsAclRestoreResult>(args, { timeoutMs: 60_000 })
+  } catch (e) {
+    logForDebugging(`[Sandbox Windows] acl restore: ${(e as Error).message}`, {
+      level: 'error',
+    })
+    return undefined
+  }
+}
+
+/**
+ * Per-path outcomes that mean the file's DACL was returned to its
+ * pre-stamp state (or was already there). Anything else left the
+ * stamp in place and should be surfaced to the user.
+ */
+export const WINDOWS_ACL_PATH_OK = new Set<WindowsAclPathOutcome['status']>([
+  'restored',
+])
+
+/**
+ * Per-parent-directory outcomes that are expected during normal
+ * teardown. `stillHeld` is normal when another active session
+ * still references a file under this directory.
+ */
+export const WINDOWS_ACL_PARENT_OK = new Set<WindowsAclParentOutcome['status']>(
+  ['restored', 'alreadyOriginal', 'stillHeld'],
+)
+
+// ────────────────────────────────────────────────────────────────────
 // Wrap
 // ────────────────────────────────────────────────────────────────────
 
@@ -559,6 +817,9 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // outer spawn is `shell:false`, so the value is an argv element,
   // never shell-interpolated.
   if (p.sublayerGuid) argv.push('--sublayer-guid', p.sublayerGuid)
+  if (p.holderPid !== undefined) {
+    argv.push('--holder-pid', `${p.holderPid}`)
+  }
   argv.push('--')
 
   const systemRoot = process.env.SystemRoot ?? 'C:\\Windows'
@@ -607,8 +868,24 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
       break
   }
 
-  // Generated proxy vars override any inherited ones so the child
-  // always routes through this sandbox's proxies.
+  // Drop/overwrite denied credential env vars from the inherited
+  // environment FIRST. The proxy assignments below must come LAST
+  // so SRT's own proxy plumbing vars survive even if a caller lists
+  // one of them as a denied credential — same precedence as the
+  // macOS/Linux `env -u … VAR=… sandbox-exec` order.
+  //
+  // Windows env is case-insensitive but Node preserves the OS
+  // casing on enumeration, so a `delete baseEnv['SECRET']` would
+  // miss a `Secret` key. Match by uppercased name instead.
+  const baseEnv: NodeJS.ProcessEnv = { ...process.env }
+  const unsetUpper = new Set((p.unsetEnvVars ?? []).map(k => k.toUpperCase()))
+  for (const k of Object.keys(baseEnv)) {
+    if (unsetUpper.has(k.toUpperCase())) delete baseEnv[k]
+  }
+  Object.assign(baseEnv, p.setEnvVars ?? {})
+
+  // Generated proxy vars override any inherited (or just-masked)
+  // ones so the child always routes through this sandbox's proxies.
   const generated = envListToObject(
     generateProxyEnvVars(
       p.httpProxyPort,
@@ -620,7 +897,7 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // TMPDIR is a POSIX path meant for the macOS/Linux FS sandbox — it
   // serves no purpose on Windows and breaks msys2 tools (mktemp etc.).
   delete generated.TMPDIR
-  const env: NodeJS.ProcessEnv = { ...process.env, ...generated }
+  const env: NodeJS.ProcessEnv = { ...baseEnv, ...generated }
   return { argv, env }
 }
 

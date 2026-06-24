@@ -65,6 +65,39 @@ export function containsGlobChars(pathPattern: string): boolean {
 }
 
 /**
+ * Windows-specific glob-char check. `[` and `]` are NOT
+ * metachars here — they are legal in Win32 filenames, so a
+ * literal `C:\app\[prod].env` must route to the literal-path
+ * branch, not glob expansion (where it would match nothing and
+ * be silently dropped). Only `*` and `?` trigger expansion.
+ */
+export function containsGlobCharsWin(p: string): boolean {
+  return p.includes('*') || p.includes('?')
+}
+
+/** Platform-appropriate glob-char check. */
+function containsGlobCharsForPlatform(p: string): boolean {
+  return getPlatform() === 'windows'
+    ? containsGlobCharsWin(p)
+    : containsGlobChars(p)
+}
+
+/**
+ * Strip the Win32 `\\?\` extended-path prefix so the residue is
+ * a conventional absolute path (drive-letter or UNC) with no `?`
+ * for the glob-char check to misclassify. `\\?\UNC\srv\share\f`
+ * → `\\srv\share\f`; `\\?\C:\f` → `C:\f`; anything else → input.
+ * The UNC marker is matched case-insensitively (Windows accepts
+ * `\\?\unc\…` in any casing; a case-sensitive check would fall
+ * through to the 4-char strip and yield a cwd-relative residue).
+ */
+export function stripExtendedPathPrefix(p: string): string {
+  if (/^\\\\\?\\unc\\/i.test(p)) return '\\\\' + p.slice(8)
+  if (p.startsWith('\\\\?\\')) return p.slice(4)
+  return p
+}
+
+/**
  * Remove trailing /** glob suffix from a path pattern
  * Used to normalize path patterns since /** just means "directory and everything under it"
  */
@@ -195,6 +228,24 @@ export function isSymlinkOutsideBoundary(
 }
 
 /**
+ * Expand a leading `~` to the home directory. Handles bare `~`,
+ * `~/…`, and (on Windows only) the `~\…` form so callers don't each
+ * open-code the variants. `~\` is gated to Windows because `\` is a
+ * valid POSIX filename byte — `~\foo` is a legal relative filename
+ * on Linux/macOS and must NOT tilde-expand there.
+ */
+export function expandTilde(p: string): string {
+  if (p === '~') return homedir()
+  if (
+    p.startsWith('~/') ||
+    (process.platform === 'win32' && p.startsWith('~\\'))
+  ) {
+    return homedir() + p.slice(1)
+  }
+  return p
+}
+
+/**
  * Normalize a path for use in sandbox configurations
  * Handles:
  * - Tilde (~) expansion for home directory
@@ -207,13 +258,19 @@ export function isSymlinkOutsideBoundary(
  */
 export function normalizePathForSandbox(pathPattern: string): string {
   const cwd = process.cwd()
-  let normalizedPath = pathPattern
+  // Windows pre-processing: strip the `\\?\` / `\\?\UNC\` extended
+  // prefix (its `?` is a literal, not a glob char) and uppercase
+  // the drive letter so `c:\…` and `C:\…` normalize identically.
+  if (getPlatform() === 'windows') {
+    pathPattern = stripExtendedPathPrefix(pathPattern)
+    if (/^[a-z]:/.test(pathPattern)) {
+      pathPattern = pathPattern[0].toUpperCase() + pathPattern.slice(1)
+    }
+  }
+  let normalizedPath = expandTilde(pathPattern)
 
-  // Expand ~ to home directory
-  if (pathPattern === '~') {
-    normalizedPath = homedir()
-  } else if (pathPattern.startsWith('~/')) {
-    normalizedPath = homedir() + pathPattern.slice(1)
+  if (normalizedPath !== pathPattern) {
+    // tilde was expanded above
   } else if (pathPattern.startsWith('./') || pathPattern.startsWith('../')) {
     // Convert relative to absolute based on current working directory
     normalizedPath = path.resolve(cwd, pathPattern)
@@ -223,9 +280,11 @@ export function normalizePathForSandbox(pathPattern: string): string {
   }
 
   // For glob patterns, resolve symlinks for the directory portion only
-  if (containsGlobChars(normalizedPath)) {
+  if (containsGlobCharsForPlatform(normalizedPath)) {
     // Extract the static directory prefix before glob characters
-    const staticPrefix = normalizedPath.split(/[*?[\]]/)[0]
+    // (on Windows, `[`/`]` are literal so only split on `*`/`?`).
+    const splitRe = getPlatform() === 'windows' ? /[*?]/ : /[*?[\]]/
+    const staticPrefix = normalizedPath.split(splitRe)[0]
     if (staticPrefix && staticPrefix !== '/') {
       // Get the directory containing the glob pattern
       // If staticPrefix ends with /, remove it to get the directory
@@ -524,18 +583,39 @@ export function globToRegex(globPattern: string): string {
   )
 }
 
+export interface ExpandGlobOptions {
+  /**
+   * Match case-insensitively. Set this on Windows where the
+   * pattern's static prefix may differ in case from what
+   * `readdirSync` returns. Default: false (Linux/macOS callers
+   * don't need it).
+   */
+  caseInsensitive?: boolean
+}
+
 /**
  * Expand a glob pattern into concrete file paths.
  *
- * Used on Linux where bubblewrap doesn't support glob patterns natively.
- * Resolves the static directory prefix, lists files recursively, and filters
- * using globToRegex().
+ * Used on Linux (where bubblewrap doesn't support glob patterns
+ * natively) and Windows (point-in-time expansion before `srt-win
+ * acl stamp`). Resolves the static directory prefix, lists files
+ * recursively, and filters using {@link globToRegex}.
  *
  * @param globPath - A path pattern containing glob characters (e.g., ~/test/*.env)
  * @returns Array of absolute paths matching the glob pattern
  */
-export function expandGlobPattern(globPath: string): string[] {
-  const normalizedPattern = normalizePathForSandbox(globPath)
+export function expandGlobPattern(
+  globPath: string,
+  opts: ExpandGlobOptions = {},
+): string[] {
+  // Normalize to `/` separators throughout so {@link globToRegex}
+  // (which treats `/` as the segment boundary) and the static-prefix
+  // split work on Windows paths. Gated to win32: `\` is a valid
+  // filename byte on POSIX, so rewriting it there would change the
+  // path (e.g. a Linux directory literally named `app\creds`).
+  const toFwd = (s: string) =>
+    process.platform === 'win32' ? s.replace(/\\/g, '/') : s
+  const normalizedPattern = toFwd(normalizePathForSandbox(globPath))
 
   // Extract the static directory prefix before any glob characters
   const staticPrefix = normalizedPattern.split(/[*?[\]]/)[0]
@@ -557,7 +637,10 @@ export function expandGlobPattern(globPath: string): string[] {
   }
 
   // Build regex from the normalized glob pattern
-  const regex = new RegExp(globToRegex(normalizedPattern))
+  const regex = new RegExp(
+    globToRegex(normalizedPattern),
+    opts.caseInsensitive ? 'i' : '',
+  )
 
   // List all entries recursively under the base directory
   const results: string[] = []
@@ -577,7 +660,7 @@ export function expandGlobPattern(globPath: string): string[] {
         baseDir
       const fullPath = path.join(parentDir, entry.name)
 
-      if (regex.test(fullPath)) {
+      if (regex.test(toFwd(fullPath))) {
         results.push(fullPath)
       }
     }

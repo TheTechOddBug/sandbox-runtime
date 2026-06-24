@@ -66,10 +66,10 @@ jobs:
       - name: Install sqlite3 CLI (Windows, for smoke-acl DB-poison tests)
         if: matrix.os == 'windows'
         shell: pwsh
-        # Pinned: an unpinned `choco install` would pull whatever
-        # the community feed serves on the day, which is a
-        # supply-chain vector for the DB-poison security tests.
-        run: choco install sqlite --version=3.50.4 --no-progress -y
+        # The smoke-acl H4/H6/H8/R2 rows only need *a* sqlite3 CLI
+        # to inspect the state DB, not a specific version. Was
+        # pinned to 3.50.4, which the community feed delisted.
+        run: choco install sqlite --no-progress -y
 
       - name: Build srt-win (Windows)
         if: matrix.os == 'windows'

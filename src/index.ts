@@ -55,6 +55,11 @@ export {
   deleteWindowsGroup,
   createWindowsWfp,
   windowsInstallInstructions,
+  stampWindowsAcl,
+  restoreWindowsAcl,
+  expandWindowsFsDenyPaths,
+  WINDOWS_ACL_PATH_OK,
+  WINDOWS_ACL_PARENT_OK,
   DEFAULT_WINDOWS_GROUP_NAME,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
 } from './sandbox/windows-sandbox-utils.js'
@@ -65,6 +70,11 @@ export type {
   WindowsGroupStatus,
   WindowsGroupStatusResult,
   WindowsWfpStatus,
+  WindowsAclStampOptions,
+  WindowsAclRestoreOptions,
+  WindowsAclRestoreResult,
+  WindowsAclPathOutcome,
+  WindowsAclParentOutcome,
   WindowsWfpStatusResult,
 } from './sandbox/windows-sandbox-utils.js'
 export type { WindowsConfig } from './sandbox/sandbox-config.js'
