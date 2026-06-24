@@ -1,4 +1,4 @@
-import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
+import { describe, test, expect, beforeAll, afterAll, spyOn } from 'bun:test'
 import { spawn, spawnSync } from 'node:child_process'
 import {
   existsSync,
@@ -352,22 +352,110 @@ describe('buildMaskedFileBinds', () => {
     store.dispose()
   })
 
-  test('extract with no match degrades the entry to deny', () => {
-    const reg = new SentinelRegistry()
-    const store = new MaskedFileStore()
-    const { binds, degradeToDenyPaths } = buildMaskedFileBinds(
-      [{ path: HOSTS_YML, mode: 'mask', extract: 'no_such_key: (\\S+)' }],
-      ['api.github.com'],
-      reg,
-      store,
-    )
-    // Fail-closed: no bind is emitted (the real file is NOT exposed),
-    // and the path is reported for the read-deny set.
-    expect(binds).toHaveLength(0)
-    expect(degradeToDenyPaths).toEqual([realpathSync(HOSTS_YML)])
-    expect(reg.size).toBe(0)
-    expect(store.dirPath).toBeUndefined()
-    store.dispose()
+  describe('extract with no match (onExtractNoMatch)', () => {
+    const noMatch = { path: HOSTS_YML, mode: 'mask', extract: 'nope: (\\S+)' }
+
+    test('default → "warn": file left unprotected, stderr warning', () => {
+      const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+      const reg = new SentinelRegistry()
+      const store = new MaskedFileStore()
+      const { binds, degradeToDenyPaths } = buildMaskedFileBinds(
+        [noMatch] as const,
+        ['api.github.com'],
+        reg,
+        store,
+      )
+      // Fail-open: no bind, no deny — the entry is skipped entirely so
+      // the real file stays readable via the root mount.
+      expect(binds).toHaveLength(0)
+      expect(degradeToDenyPaths).toHaveLength(0)
+      expect(reg.size).toBe(0)
+      expect(store.dirPath).toBeUndefined()
+      // A loud stderr warning surfaces the config error to the operator.
+      expect(warnSpy).toHaveBeenCalledTimes(1)
+      const msg = warnSpy.mock.calls[0]![0] as string
+      expect(msg).toContain('UNPROTECTED')
+      expect(msg).toContain(HOSTS_YML)
+      expect(msg).toContain('nope: (\\S+)')
+      warnSpy.mockRestore()
+      store.dispose()
+    })
+
+    test('explicit "warn" matches the default', () => {
+      const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+      const reg = new SentinelRegistry()
+      const store = new MaskedFileStore()
+      const { binds, degradeToDenyPaths } = buildMaskedFileBinds(
+        [{ ...noMatch, onExtractNoMatch: 'warn' }] as const,
+        [],
+        reg,
+        store,
+      )
+      expect(binds).toHaveLength(0)
+      expect(degradeToDenyPaths).toHaveLength(0)
+      expect(warnSpy).toHaveBeenCalledTimes(1)
+      warnSpy.mockRestore()
+      store.dispose()
+    })
+
+    test('"deny": entry degrades to read-deny (fail-closed)', () => {
+      const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+      const reg = new SentinelRegistry()
+      const store = new MaskedFileStore()
+      const { binds, degradeToDenyPaths } = buildMaskedFileBinds(
+        [{ ...noMatch, onExtractNoMatch: 'deny' }] as const,
+        ['api.github.com'],
+        reg,
+        store,
+      )
+      // No bind is emitted (the real file is NOT exposed); the resolved
+      // path is reported for the read-deny set.
+      expect(binds).toHaveLength(0)
+      expect(degradeToDenyPaths).toEqual([realpathSync(HOSTS_YML)])
+      expect(reg.size).toBe(0)
+      expect(store.dirPath).toBeUndefined()
+      // No stderr warning — deny is a configured outcome, not a surprise.
+      expect(warnSpy).not.toHaveBeenCalled()
+      warnSpy.mockRestore()
+      store.dispose()
+    })
+
+    test('"error": throws with a clear message', () => {
+      const reg = new SentinelRegistry()
+      const store = new MaskedFileStore()
+      expect(() =>
+        buildMaskedFileBinds(
+          [{ ...noMatch, onExtractNoMatch: 'error' }] as const,
+          [],
+          reg,
+          store,
+        ),
+      ).toThrow(/matched nothing.*onExtractNoMatch: "error"/)
+      store.dispose()
+    })
+
+    test('onExtractNoMatch is per-entry: one "deny" does not affect a sibling "warn"', () => {
+      const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+      const other = join(FIXTURE_DIR, 'other.yml')
+      writeFileSync(other, 'k: v\n')
+      const reg = new SentinelRegistry()
+      const store = new MaskedFileStore()
+      const { binds, degradeToDenyPaths } = buildMaskedFileBinds(
+        [
+          { ...noMatch, onExtractNoMatch: 'deny' },
+          { path: other, mode: 'mask', extract: 'nope: (\\S+)' },
+        ] as const,
+        [],
+        reg,
+        store,
+      )
+      expect(binds).toHaveLength(0)
+      expect(degradeToDenyPaths).toEqual([realpathSync(HOSTS_YML)])
+      expect(warnSpy).toHaveBeenCalledTimes(1)
+      expect(warnSpy.mock.calls[0]![0] as string).toContain(other)
+      warnSpy.mockRestore()
+      store.dispose()
+    })
   })
 })
 
@@ -454,18 +542,16 @@ describe.if(isLinux)('structured file masking on Linux (extract)', () => {
 })
 
 /**
- * Linux: an `extract` pattern that matches nothing degrades to deny —
- * the file is unreadable inside the sandbox so the credential the entry
- * was meant to protect is never exposed.
+ * Linux integration: an `extract` pattern that matches nothing follows
+ * the entry's `onExtractNoMatch` — default `"warn"` leaves the file
+ * readable as-is with a stderr warning; `"deny"` makes it unreadable.
  */
-describe.if(isLinux)('extract no-match degrades to deny on Linux', () => {
+describe.if(isLinux)('extract no-match onExtractNoMatch on Linux', () => {
   const TEST_DIR = join(tmpdir(), 'srt-credmask-nomatch-' + Date.now())
   const SECRET_FILE = join(TEST_DIR, 'hosts.yml')
   const SECRET = 'gho_nomatch_real_0123456789'
 
-  beforeAll(async () => {
-    mkdirSync(TEST_DIR, { recursive: true })
-    writeFileSync(SECRET_FILE, `oauth_token: ${SECRET}\n`)
+  async function init(onExtractNoMatch?: 'warn' | 'deny' | 'error') {
     await SandboxManager.reset()
     await SandboxManager.initialize({
       network: { allowedDomains: ['localhost'], deniedDomains: [] },
@@ -476,11 +562,17 @@ describe.if(isLinux)('extract no-match degrades to deny on Linux', () => {
             path: SECRET_FILE,
             mode: 'mask',
             extract: 'will_not_match_(\\S+)',
+            ...(onExtractNoMatch && { onExtractNoMatch }),
           },
         ],
         allowPlaintextInject: true,
       },
     })
+  }
+
+  beforeAll(() => {
+    mkdirSync(TEST_DIR, { recursive: true })
+    writeFileSync(SECRET_FILE, `oauth_token: ${SECRET}\n`)
   })
 
   afterAll(async () => {
@@ -488,7 +580,32 @@ describe.if(isLinux)('extract no-match degrades to deny on Linux', () => {
     rmSync(TEST_DIR, { recursive: true, force: true })
   })
 
-  test('reading the file inside the sandbox is denied (fail-closed)', async () => {
+  test('default ("warn"): file readable as-is, stderr warning at wrap', async () => {
+    await init()
+    const warnSpy = spyOn(console, 'warn').mockImplementation(() => {})
+    const wrapped = await SandboxManager.wrapWithSandbox(`cat ${SECRET_FILE}`)
+    // A loud stderr warning surfaces the config error at wrap time.
+    expect(warnSpy).toHaveBeenCalled()
+    expect(warnSpy.mock.calls[0]![0] as string).toContain('UNPROTECTED')
+    warnSpy.mockRestore()
+    // No fake-file bind and no /dev/null deny bind are emitted for the
+    // path — the entry is skipped entirely.
+    expect(wrapped).not.toMatch(
+      new RegExp(`--ro-bind \\S+ ${SECRET_FILE.replace(/\//g, '\\/')}\\b`),
+    )
+    const result = spawnSync(wrapped, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 10000,
+    })
+    // cat succeeds and returns the real bytes: fail-open means the
+    // file is left readable via the root mount.
+    expect(result.status).toBe(0)
+    expect(result.stdout).toBe(`oauth_token: ${SECRET}\n`)
+  })
+
+  test('"deny": file unreadable inside the sandbox (fail-closed)', async () => {
+    await init('deny')
     const wrapped = await SandboxManager.wrapWithSandbox(`cat ${SECRET_FILE}`)
     // The real credential never appears in the wrapped command.
     expect(wrapped).not.toContain(SECRET)
@@ -506,6 +623,20 @@ describe.if(isLinux)('extract no-match degrades to deny on Linux', () => {
     // real bytes are never exposed on stdout.
     expect(result.status).not.toBe(0)
     expect(result.stdout).not.toContain(SECRET)
+  })
+
+  test('"error": wrapWithSandbox rejects', async () => {
+    await init('error')
+    let thrown: unknown
+    try {
+      await SandboxManager.wrapWithSandbox(`cat ${SECRET_FILE}`)
+    } catch (e) {
+      thrown = e
+    }
+    expect(thrown).toBeInstanceOf(Error)
+    expect((thrown as Error).message).toMatch(
+      /matched nothing.*onExtractNoMatch: "error"/,
+    )
   })
 })
 
