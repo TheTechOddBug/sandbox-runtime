@@ -2,6 +2,10 @@ import { createHttpProxyServer } from './http-proxy.js'
 import { createSocksProxyServer } from './socks-proxy.js'
 import type { SocksProxyWrapper } from './socks-proxy.js'
 import { SentinelRegistry } from './credential-sentinel.js'
+import {
+  MaskedFileStore,
+  buildMaskedFileBinds,
+} from './credential-mask-files.js'
 import { createMitmCA, disposeMitmCA, type MitmCA } from './mitm-ca.js'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
@@ -86,6 +90,9 @@ const sandboxViolationStore = new SandboxViolationStore()
 // Per-session sentinel↔real-value map for masked credentials. Lives only in
 // process memory; never written to disk or logged. Cleared on reset().
 const sentinelRegistry = new SentinelRegistry()
+// Temp dir holding the sentinel-content fake files for masked credential
+// files. Created lazily on first masked file; removed on reset().
+const maskedFileStore = new MaskedFileStore()
 
 // ============================================================================
 // Private Helper Functions (not exported)
@@ -587,7 +594,13 @@ function getCredentialRestrictions(
   allowedDomains: readonly string[] | undefined,
 ): CredentialRestrictionConfig {
   if (!credentials) {
-    return { denyReadPaths: [], unsetEnvVars: [], setEnvVars: {} }
+    return {
+      denyReadPaths: [],
+      unsetEnvVars: [],
+      setEnvVars: {},
+      maskedFileBinds: [],
+      maskedFileStoreDir: undefined,
+    }
   }
 
   const files = credentials.files ?? []
@@ -612,10 +625,22 @@ function getCredentialRestrictions(
     }
   }
 
+  // Masked files: read the real bytes on the host, register a sentinel,
+  // write it to a fake file in the manager-owned temp dir. Missing/unreadable
+  // entries are skipped (same posture as an unset masked env var).
+  const maskedFileBinds = buildMaskedFileBinds(
+    files,
+    allowedDomains ?? [],
+    sentinelRegistry,
+    maskedFileStore,
+  )
+
   return {
     denyReadPaths: [...new Set(denyReadPaths)],
     unsetEnvVars: [...new Set(unsetEnvVars)],
     setEnvVars,
+    maskedFileBinds,
+    maskedFileStoreDir: maskedFileStore.dirPath,
   }
 }
 
@@ -969,6 +994,7 @@ async function wrapWithSandbox(
         writeConfig,
         unsetEnvVars: credentialRestrictions.unsetEnvVars,
         setEnvVars: credentialRestrictions.setEnvVars,
+        maskedFileBinds: credentialRestrictions.maskedFileBinds,
         allowUnixSockets: getAllowUnixSockets(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         allowLocalBinding: getAllowLocalBinding(),
@@ -1004,6 +1030,8 @@ async function wrapWithSandbox(
         writeConfig,
         unsetEnvVars: credentialRestrictions.unsetEnvVars,
         setEnvVars: credentialRestrictions.setEnvVars,
+        maskedFileBinds: credentialRestrictions.maskedFileBinds,
+        maskedFileStoreDir: credentialRestrictions.maskedFileStoreDir,
         enableWeakerNestedSandbox: getEnableWeakerNestedSandbox(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         binShell,
@@ -1334,6 +1362,7 @@ async function reset(): Promise<void> {
   parentProxy = undefined
   mitmCA = undefined
   sentinelRegistry.clear()
+  maskedFileStore.dispose()
 }
 
 function getSandboxViolationStore() {
@@ -1450,6 +1479,7 @@ export interface ISandboxManager {
   getConfig(): SandboxRuntimeConfig | undefined
   getMitmCA(): MitmCA | undefined
   getSentinelRegistry(): SentinelRegistry
+  getMaskedFileStore(): MaskedFileStore
   updateConfig(newConfig: SandboxRuntimeConfig): void
   cleanupAfterCommand(): void
   reset(): Promise<void>
@@ -1488,6 +1518,7 @@ export const SandboxManager: ISandboxManager = {
   reset,
   getMitmCA: () => mitmCA,
   getSentinelRegistry: () => sentinelRegistry,
+  getMaskedFileStore: () => maskedFileStore,
   getSandboxViolationStore,
   annotateStderrWithSandboxFailures,
   getLinuxGlobPatternWarnings,

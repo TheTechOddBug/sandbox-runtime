@@ -44,11 +44,20 @@ export interface FsWriteRestrictionConfig {
  * - `unsetEnvVars`: environment variable names to unset inside the sandbox.
  * - `setEnvVars`: environment variables to set inside the sandbox to a
  *   sentinel value (overrides the inherited real value).
+ * - `maskedFileBinds`: (realPath → fakePath) pairs for whole-file masking;
+ *   the platform layer binds fakePath over realPath read-only so the
+ *   sandbox reads a sentinel instead of the real bytes (Linux only —
+ *   macOS degrades these to denyReadPaths).
+ * - `maskedFileStoreDir`: host directory holding the fake files. The
+ *   Linux layer ro-binds it over itself so the sandbox cannot tamper
+ *   with the bind sources regardless of allowWrite.
  */
 export interface CredentialRestrictionConfig {
   denyReadPaths: string[]
   unsetEnvVars: string[]
   setEnvVars: Record<string, string>
+  maskedFileBinds: Array<{ realPath: string; fakePath: string }>
+  maskedFileStoreDir: string | undefined
 }
 
 /**

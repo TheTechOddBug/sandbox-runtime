@@ -39,6 +39,12 @@ export interface MacOSSandboxParams {
   unsetEnvVars?: string[]
   /** Environment variables to set for the sandboxed child (env NAME=VALUE) */
   setEnvVars?: Record<string, string>
+  /**
+   * Whole-file credential masks. SBPL cannot redirect reads, so on macOS
+   * these degrade to read-deny on realPath until the DYLD interposer
+   * lands. fakePath is unused here.
+   */
+  maskedFileBinds?: Array<{ realPath: string; fakePath: string }>
   ignoreViolations?: IgnoreViolationsConfig | undefined
   allowPty?: boolean
   allowGitConfig?: boolean
@@ -786,16 +792,37 @@ export function wrapCommandWithSandboxMacOS(
     allowAllUnixSockets,
     allowLocalBinding,
     allowMachLookup,
-    readConfig,
+    readConfig: readConfigIn,
     writeConfig,
     unsetEnvVars,
     setEnvVars,
+    maskedFileBinds,
     allowPty,
     allowGitConfig = false,
     enableWeakerNetworkIsolation = false,
     allowAppleEvents = false,
     binShell,
   } = params
+
+  // SBPL cannot redirect a read to different bytes, so whole-file masking
+  // degrades to read-deny on macOS: the sandboxed process gets EPERM
+  // instead of the sentinel. The DYLD interposer (a later step) lifts
+  // this. Folding the masked paths into denyOnly here means the existing
+  // generateReadRules() emits the (deny file-read* …) rule unchanged.
+  let readConfig = readConfigIn
+  if (maskedFileBinds && maskedFileBinds.length > 0) {
+    logForDebugging(
+      '[Sandbox macOS] file mask degrades to deny on macOS until the ' +
+        'interposer lands',
+    )
+    readConfig = {
+      denyOnly: [
+        ...(readConfigIn?.denyOnly ?? []),
+        ...maskedFileBinds.map(b => b.realPath),
+      ],
+      allowWithinDeny: readConfigIn?.allowWithinDeny,
+    }
+  }
 
   // Determine if we have restrictions to apply
   // Read: denyOnly pattern - empty array means no restrictions
