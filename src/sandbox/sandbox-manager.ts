@@ -252,6 +252,49 @@ function getMitmSocketPath(host: string): string | undefined {
   return undefined
 }
 
+/**
+ * Per-host TLS-termination opt-out from network.tlsTerminate.excludeDomains.
+ * Only consulted by the HTTP proxy when tlsTerminate is enabled; exempted
+ * hosts fall back to the opaque CONNECT tunnel (still allowlist-filtered),
+ * so mTLS / cert-pinning clients can complete their own handshake.
+ *
+ * Matches the canonicalized hostname, like the allow/deny filter
+ * (filterNetworkRequest) — otherwise a spelling the allowlist accepts after
+ * canonicalization (`127.1`, a trailing-dot FQDN) would dodge the exclusion
+ * and get terminated anyway.
+ */
+function shouldTerminateTLSForHost(host: string): boolean {
+  const excludeDomains = config?.network.tlsTerminate?.excludeDomains
+  if (!excludeDomains?.length) return true
+  const canonicalHost = canonicalizeHost(host) ?? host
+  for (const pattern of excludeDomains) {
+    if (!matchesDomainPattern(canonicalHost, pattern)) continue
+    logForDebugging(
+      `Host ${host} matches tlsTerminate.excludeDomains pattern ${pattern}; skipping TLS termination`,
+    )
+    // Masked-credential substitution only happens on the terminated path,
+    // so a credential whose injectHosts cover this host can never be
+    // injected here — the upstream gets the placeholder. Config validation
+    // rejects the fully-contradictory spellings; this flags the partial
+    // ones (e.g. default injectHosts = allowedDomains) at the moment they
+    // actually bite.
+    const masked = sentinelRegistry.namesInjectableAt(
+      canonicalHost,
+      matchesDomainPattern,
+    )
+    if (masked.length > 0) {
+      logForDebugging(
+        `tlsTerminate.excludeDomains: masked credential(s) ${masked.join(', ')} ` +
+          `are configured for injection at ${host}, but its connections are ` +
+          `not terminated, so the upstream will receive the placeholder`,
+        { level: 'error' },
+      )
+    }
+    return false
+  }
+  return true
+}
+
 async function startMuxProxyServer(
   sandboxAskCallback: SandboxAskCallback | undefined,
   portRange: readonly [number, number] | undefined,
@@ -262,6 +305,7 @@ async function startMuxProxyServer(
       filterNetworkRequest(port, host, sandboxAskCallback),
     getMitmSocketPath,
     mitmCA,
+    shouldTerminateTLS: shouldTerminateTLSForHost,
     filterRequest: config?.network.filterRequest,
     // TLS-terminated path always gets the injector; the plain-HTTP path
     // only when explicitly opted in. Without the opt-in, a sentinel sent
@@ -1044,11 +1088,11 @@ async function wrapWithSandbox(
         expandedAllowRead.push(stripped)
       }
     }
-    // The TLS-termination CA cert must be readable by the child so the trust
-    // env vars (NODE_EXTRA_CA_CERTS etc.) resolve, even if its path falls
-    // under a user-configured denyRead.
+    // The TLS-termination CA cert and the trust bundle the env vars point at
+    // (NODE_EXTRA_CA_CERTS etc.) must be readable by the child, even if their
+    // paths fall under a user-configured denyRead.
     if (mitmCA) {
-      expandedAllowRead.push(mitmCA.certPath)
+      expandedAllowRead.push(mitmCA.certPath, mitmCA.trustBundlePath)
     }
     readConfig = {
       denyOnly: expandedDenyRead,
@@ -1093,7 +1137,7 @@ async function wrapWithSandbox(
         httpProxyPort: needsNetworkProxy ? getProxyPort() : undefined,
         socksProxyPort: needsNetworkProxy ? getSocksProxyPort() : undefined,
         proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
-        caCertPath: mitmCA?.certPath,
+        caCertPath: mitmCA?.trustBundlePath,
         readConfig,
         writeConfig,
         unsetEnvVars: credentialRestrictions.unsetEnvVars,
@@ -1129,7 +1173,7 @@ async function wrapWithSandbox(
           ? managerContext?.socksProxyPort
           : undefined,
         proxyAuthToken: needsNetworkProxy ? proxyAuthToken : undefined,
-        caCertPath: mitmCA?.certPath,
+        caCertPath: mitmCA?.trustBundlePath,
         readConfig,
         writeConfig,
         unsetEnvVars: credentialRestrictions.unsetEnvVars,

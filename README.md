@@ -287,6 +287,24 @@ Uses an **allow-only pattern** - all network access is denied by default.
 - `network.deniedDomains` - Array of denied domains (checked first, takes precedence over allowedDomains)
 - `network.allowLocalBinding` - Allow binding to local ports (boolean, default: false)
 
+**TLS termination** (`network.tlsTerminate`, experimental): when set, HTTPS CONNECTs are terminated in-process so SRT can see (and filter, via `network.filterRequest`) the decrypted requests. The sandboxed process is pointed at a trust bundle containing the MITM CA (`caCertPath`/`caKeyPath`, or an ephemeral CA if omitted) plus the host's regular roots, so proxy-minted certificates and real upstream certificates both verify.
+
+- `network.tlsTerminate.excludeDomains` - Domain patterns (same syntax as `allowedDomains`) that are **not** terminated. Matching CONNECTs are tunnelled opaquely instead: they are still subject to the domain allowlist, but the client inside the sandbox completes its own TLS handshake with the real upstream, and `filterRequest` / credential injection do not apply to their HTTPS traffic. Use this for the two cases TLS termination fundamentally breaks:
+  - **mTLS upstreams** - only the in-sandbox client holds the client certificate, so the proxy cannot re-originate the connection on its behalf.
+  - **Certificate-pinning clients** - clients that verify the upstream's identity themselves (custom CAs, SAN pinning) and reject the MITM certificate.
+
+```json
+{
+  "network": {
+    "allowedDomains": ["*.example.com", "internal-mtls.example.net"],
+    "deniedDomains": [],
+    "tlsTerminate": {
+      "excludeDomains": ["internal-mtls.example.net"]
+    }
+  }
+}
+```
+
 **Unix Socket Settings** (platform-specific behavior):
 
 | Setting                        | macOS                     | Linux                                    |
