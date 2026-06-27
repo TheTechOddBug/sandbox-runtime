@@ -1556,3 +1556,147 @@ describe.if(isWindows)('Windows sandbox: file deny', () => {
     await SandboxManager.reset()
   }, 60_000)
 })
+
+// ────────────────────────────────────────────────────────────────────
+// Group H — --as-sandbox-user two-hop launch (separate-user path)
+//
+// H0 is a pure argv-shape assertion (runs on every platform). H1+ do
+// actual two-hop execs and are gated on
+// `SRT_WIN_AS_SANDBOX_USER=1`: they need the `srt-sandbox` account
+// provisioned, and the same-user E/B/C/D/F rows above must stay
+// green regardless of whether the separate-user path is enabled.
+// `vendor/srt-win-src/ci/smoke-exec.ps1` R1-R9b cover the two-hop
+// end-to-end on every CI run; this block proves the TS plumbing on
+// top once the path is enabled.
+// ────────────────────────────────────────────────────────────────────
+
+describe('Windows sandbox: --as-sandbox-user argv shape (pure, all platforms)', () => {
+  it('H0: asSandboxUser:true adds --as-sandbox-user before --, omits when false', () => {
+    const prev = process.env.SRT_WIN_PATH
+    process.env.SRT_WIN_PATH = process.execPath
+    try {
+      const on = wrapCommandWithSandboxWindows({
+        command: 'exit 0',
+        group: { groupSid: ADMINS_SID },
+        asSandboxUser: true,
+        caCertPath: 'C:/ca.pem',
+        httpProxyPort: 60080,
+      })
+      expect(on.argv).toContain('--as-sandbox-user')
+      // CA trust is install-time, NEVER on the per-exec argv.
+      expect(on.argv).not.toContain('--ca-trust')
+      // Flags must precede `--` (clap stops parsing after it).
+      expect(on.argv.indexOf('--as-sandbox-user')).toBeLessThan(
+        on.argv.indexOf('--'),
+      )
+      // Two-hop overlay rides on --env: PATH + the single-sourced
+      // proxy set. Values follow each --env as KEY=VALUE.
+      const envArgs = on.argv.filter((_, i) => on.argv[i - 1] === '--env')
+      expect(envArgs.some(e => e.startsWith('PATH='))).toBe(true)
+      expect(envArgs).toContain('HTTP_PROXY=http://localhost:60080')
+      // CA-bundle vars are NOT forwarded under asSandboxUser — the
+      // bundle lives in broker %TEMP%, unreadable by srt-sandbox.
+      // Schannel trust comes from `user trust-ca` instead.
+      expect(envArgs.some(e => e.startsWith('NODE_EXTRA_CA_CERTS='))).toBe(
+        false,
+      )
+      expect(envArgs.some(e => e.startsWith('SSL_CERT_FILE='))).toBe(false)
+      // Every --env must precede `--`.
+      expect(on.argv.lastIndexOf('--env')).toBeLessThan(on.argv.indexOf('--'))
+      const off = wrapCommandWithSandboxWindows({
+        command: 'exit 0',
+        group: { groupSid: ADMINS_SID },
+      })
+      expect(off.argv).not.toContain('--as-sandbox-user')
+      expect(off.argv).not.toContain('--env')
+    } finally {
+      if (prev === undefined) delete process.env.SRT_WIN_PATH
+      else process.env.SRT_WIN_PATH = prev
+    }
+  })
+})
+
+const asSandboxUserEnabled = process.env.SRT_WIN_AS_SANDBOX_USER === '1'
+
+describe.if(isWindows && asSandboxUserEnabled)(
+  'Windows sandbox: --as-sandbox-user two-hop (H-rows)',
+  () => {
+    let exe: string
+    let sbSid: string
+
+    beforeAll(() => {
+      exe = getSrtWinPath()
+      // Full install under the test sublayer — provisions
+      // srt-sandbox + cred + user-SID WFP filters. Idempotent.
+      const inst = spawnSync(
+        exe,
+        [
+          'install',
+          '--group-sid',
+          ADMINS_SID,
+          '--sublayer-guid',
+          TEST_SUBLAYER,
+          '--proxy-port-range',
+          `${PORT_RANGE[0]}-${PORT_RANGE[1]}`,
+        ],
+        { encoding: 'utf8' },
+      )
+      if (inst.status !== 0) {
+        throw new Error(`srt-win install failed: ${inst.stderr || inst.stdout}`)
+      }
+      const us = getWindowsSandboxUserStatus()
+      if (!us.provisioned || !us.sid || !us.credPresent) {
+        throw new Error(
+          `srt-sandbox not provisioned after install: ${JSON.stringify(us)}`,
+        )
+      }
+      sbSid = us.sid
+    })
+
+    afterAll(() => {
+      spawnSync(exe, ['uninstall', '--sublayer-guid', TEST_SUBLAYER], {
+        encoding: 'utf8',
+      })
+    })
+
+    async function rexec(tail: string) {
+      const { argv, env } = wrapCommandWithSandboxWindows({
+        command: tail,
+        group: { groupSid: ADMINS_SID },
+        sublayerGuid: TEST_SUBLAYER,
+        asSandboxUser: true,
+      })
+      return spawnAsync(argv[0], argv.slice(1), {
+        env,
+        timeoutMs: 60_000,
+      })
+    }
+
+    it('H1: child runs as srt-sandbox (different user SID)', async () => {
+      const r = await rexec('whoami /user /FO CSV /NH')
+      expect(r.status).toBe(0)
+      expect(r.stdout).toContain(sbSid)
+    }, 60_000)
+
+    it('H2: stdout marker pipes through runner to broker', async () => {
+      const r = await rexec('echo H2-STDOUT-MARK')
+      expect(r.status).toBe(0)
+      expect(r.stdout).toContain('H2-STDOUT-MARK')
+    }, 60_000)
+
+    it('H3: USERPROFILE isolated to srt-sandbox', async () => {
+      const r = await rexec('echo %USERPROFILE%')
+      expect(r.status).toBe(0)
+      expect(r.stdout.toLowerCase()).toContain('srt-sandbox')
+    }, 60_000)
+
+    it('H4: direct outbound blocked by F-USER-BLOCK', async () => {
+      const r = await rexec(
+        'set "HTTP_PROXY=" & set "HTTPS_PROXY=" & set "ALL_PROXY=" & ' +
+          'curl -sS -m 5 https://example.com',
+      )
+      // Exit-code only — see B/C convention: any non-zero is fenced.
+      expect(r.status).not.toBe(0)
+    }, 60_000)
+  },
+)

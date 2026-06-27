@@ -361,6 +361,78 @@ if ($LASTEXITCODE -ne 11) {
   throw "install: invalid --group-sid expected exit 11, got $LASTEXITCODE"
 }
 
+# `user trust-ca` routes through CreateProcessWithLogonW
+# (Secondary Logon). GHA runners have it; ensure it's running
+# (idempotent).
+try { Start-Service seclogon -ea Stop } catch {
+  Write-Host "smoke: WARNING: Start-Service seclogon: $_"
+}
+
+# ── user trust-ca: cert recorded + written ─────────────────────────
+# Cert lifecycle = sandbox-user lifecycle (set via `user trust-ca`,
+# persistent until uninstall); `srt-win install` and `srt-win exec`
+# never touch it. Mint a throwaway self-signed cert (PEM), pass it
+# via `user trust-ca`, and assert `user status` surfaces
+# the thumb + a PEM that round-trips back to the same DER. The
+# one-shot CPWLW(runner) registry write into `HKU\<sbSid>` is
+# verified by the runner's stderr logging + a real-user-store leak
+# check; child-visibility under the restricted token is a Server-SKU
+# anomaly (see cert_store.rs) and is left to Win11 manual probes.
+$caDir = Join-Path $env:TEMP "srt-ca-$(Get-Random)"
+$null = mkdir $caDir
+try {
+  $ca = New-SelfSignedCertificate -Subject 'CN=srt-smoke-ca DO NOT TRUST' `
+          -CertStoreLocation Cert:\CurrentUser\My -NotAfter (Get-Date).AddDays(1)
+  $caPem = Join-Path $caDir 'ca.pem'
+  $b64 = [Convert]::ToBase64String($ca.RawData, 'InsertLineBreaks')
+  "-----BEGIN CERTIFICATE-----`n$b64`n-----END CERTIFICATE-----" |
+    Set-Content -Path $caPem -Encoding ascii
+  $thumb = $ca.Thumbprint
+  Remove-Item "Cert:\CurrentUser\My\$thumb" -ea SilentlyContinue
+
+  $out = & $Exe user trust-ca $caPem 2>&1 | Out-String
+  if ($LASTEXITCODE -ne 0) {
+    throw "user trust-ca exited ${LASTEXITCODE}: $out"
+  }
+  if ($out -notmatch '(?i)CA installed.*thumb=') {
+    throw "user trust-ca: runner did not log CA install. out: $out"
+  }
+  $usCa = J @('user', 'status')
+  if ($usCa.ca_cert_thumb -ne $thumb) {
+    throw "user status: ca_cert_thumb '$($usCa.ca_cert_thumb)' != '$thumb'"
+  }
+  if (-not $usCa.ca_cert_pem -or $usCa.ca_cert_pem -notmatch 'BEGIN CERTIFICATE') {
+    throw "user status: ca_cert_pem missing or malformed"
+  }
+  # PEM round-trips back to the same DER (so der_to_pem and the
+  # state-DB blob agree).
+  $pemBody = ($usCa.ca_cert_pem -replace '-----[^-]+-----', '' -replace '\s', '')
+  if ([Convert]::ToBase64String($ca.RawData) -ne $pemBody) {
+    throw 'user status: ca_cert_pem does not round-trip to original DER'
+  }
+  # Real user's Root must NOT have it — the write is scoped to the
+  # sandbox user's HKU\<SID>.
+  if (Get-ChildItem Cert:\CurrentUser\Root |
+      Where-Object Subject -match 'srt-smoke-ca') {
+    throw 'user trust-ca: CA leaked into REAL user CurrentUser\Root'
+  }
+  Write-Host "ca-trust ok: thumb=$thumb recorded + written into sandbox-user Root"
+
+  # `install --force` re-provisions the account but must preserve
+  # the recorded CA — write_setup_info's ON CONFLICT DO UPDATE
+  # excludes ca_cert (owned by set_ca_cert), so install never
+  # touches it.
+  Run (@('install', '--name', $instGrp, '--force') + $isl + $pr)
+  $usCa3 = J @('user', 'status')
+  if ($usCa3.ca_cert_thumb -ne $thumb) {
+    throw ("install --force: ca_cert wiped — got " +
+           "'$($usCa3.ca_cert_thumb)', expected '$thumb'")
+  }
+  Write-Host 'ca-trust ok: install --force preserves ca_cert'
+} finally {
+  Remove-Item $caDir -Recurse -Force -ea SilentlyContinue
+}
+
 # --keep-user: filters removed, sandbox user + cred file kept.
 Run (@('uninstall', '--keep-user') + $isl)
 $uw0 = J (@('wfp', 'status') + $isl)
@@ -397,6 +469,9 @@ if ($usGone.cred_present) {
 }
 if ($null -ne $usGone.marker_version) {
   throw "uninstall: setup marker row should be cleared"
+}
+if ($null -ne $usGone.ca_cert_thumb) {
+  throw "uninstall: ca_cert row should be cleared"
 }
 # Idempotent no-op: second uninstall must also exit 0.
 Run (@('uninstall') + $isl)

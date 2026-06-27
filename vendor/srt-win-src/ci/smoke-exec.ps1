@@ -126,9 +126,12 @@ if ($ws.state -ne 'installed') {
 }
 
 # ── E1: exit code propagates verbatim ────────────────────────────
+# .raw (not .out) on failure: this is the FIRST exec and srt-win's
+# own stderr diagnostics (run_lockdown, self-protect) are the only
+# clue when it fails before the child writes anything.
 $r = Exec @('--', $cmd, '/c', 'exit 42')
 if ($r.exit -ne 42) {
-  throw "E1: expected exit 42, got $($r.exit). out: $($r.out)"
+  throw "E1: expected exit 42, got $($r.exit). raw: $($r.raw)"
 }
 Write-Host 'E1 ok: exit code propagates'
 
@@ -496,10 +499,245 @@ Write-Host 'E11c ok: --skip-wfp-check silent when filters are installed'
 #   GetProcessMitigationPolicy probe). Deferred — would need a
 #   helper binary or P/Invoke from inside the sandboxed PowerShell.
 
+# ── R-rows: --as-sandbox-user two-hop launch ────────────────────
+# E1-E11 above exercised the same-user deny-only-group path. The
+# R-rows provision the dedicated `srt-sandbox` account (one
+# `srt-win install` under the same test sublayer, idempotent on the
+# group filters already there) and exercise the two-hop: broker →
+# CreateProcessWithLogonW(runner) → runner → restricted-token →
+# child. The same-user path is unchanged — these rows are additive.
+
+# CreateProcessWithLogonW routes through the Secondary Logon
+# service. GHA runners have it; ensure it's running (idempotent).
+try { Start-Service seclogon -ea Stop } catch {
+  Write-Host "smoke-exec: WARNING: Start-Service seclogon: $_"
+}
+
+# Full install under the test sublayer: provisions srt-sandbox +
+# sandbox-runtime-users + DPAPI cred + setup marker + the user-SID
+# WFP filter pair (F-USER-BLOCK / F-USER-LOOPBACK). The group-SID
+# filters from `wfp install` above are left in place.
+Run @('install',
+      '--group-sid',$GroupSid,
+      '--sublayer-guid',$Sublayer,
+      '--proxy-port-range',$PortRange)
+$us = J @('user','status')
+if (-not $us.user.exists) { throw 'R: srt-sandbox not provisioned' }
+$sbSid = $us.marker_user_sid
+if (-not $sbSid) { throw 'R: setup marker missing user_sid' }
+Write-Host "R: sandbox user provisioned (sid=$sbSid)"
+
+# Exec helper for the two-hop path. Same .exit/.raw/.out shape as
+# Exec; adds --as-sandbox-user. The broker forwards exactly what it
+# is told via --env (it does NOT enumerate its own environment), so
+# pass PATH/PATHEXT here — same overlay the TS wrapper builds.
+#
+# Watchdog: the two-hop chain (broker → CPWLW runner → restricted
+# child) has no console; a hang anywhere inside it would otherwise
+# sit until the GHA job timeout. 30s is generous — every R-row
+# payload is sub-second. System.Diagnostics.Process (not the `&`
+# call operator or Start-Process) so we get (a) WaitForExit with a
+# timeout and (b) per-element ArgumentList quoting that survives
+# PATH-with-spaces.
+function RExec {
+  param([string[]] $tail)
+  $argv = @('exec', '--group-sid', $GroupSid,
+            '--sublayer-guid', $Sublayer,
+            '--as-sandbox-user',
+            '--env', "PATH=$($env:PATH)",
+            '--env', "PATHEXT=$($env:PATHEXT)") + $tail
+  $psi = [System.Diagnostics.ProcessStartInfo]::new()
+  $psi.FileName               = $Exe
+  $psi.UseShellExecute        = $false
+  $psi.RedirectStandardOutput = $true
+  $psi.RedirectStandardError  = $true
+  foreach ($a in $argv) { $null = $psi.ArgumentList.Add($a) }
+  $p  = [System.Diagnostics.Process]::Start($psi)
+  # Drain both pipes concurrently so a full pipe buffer can't wedge
+  # WaitForExit.
+  $so = $p.StandardOutput.ReadToEndAsync()
+  $se = $p.StandardError.ReadToEndAsync()
+  if (-not $p.WaitForExit(30000)) {
+    try { $p.Kill($true) } catch { }
+    $p.WaitForExit()
+    throw ("RExec: TIMEOUT after 30s. argv: $($argv -join ' ')`n" +
+           "stderr: $($se.Result)`nstdout: $($so.Result)")
+  }
+  $exit  = $p.ExitCode
+  $raw   = $so.Result + $se.Result
+  $lines = $raw -split "`r?`n"
+  $child = ($lines | Where-Object { $_ -notmatch '^srt-win:' }) -join "`n"
+  return [pscustomobject]@{ exit = $exit; raw = $raw; out = $child }
+}
+
+# ── R1: child runs as srt-sandbox ───────────────────────────────
+$r = RExec @('--', $cmd, '/c', 'whoami /user /FO CSV /NH')
+if ($r.exit -ne 0) { throw "R1: whoami exited $($r.exit). raw: $($r.raw)" }
+$row = $r.out | ConvertFrom-Csv -Header Name,SID
+if ($row.SID -ne $sbSid) {
+  throw "R1: child user SID $($row.SID), expected $sbSid. raw: $($r.raw)"
+}
+if ($r.out -match $GroupSid) {
+  # The discriminator group is the REAL user's; the sandbox user
+  # is not a member. (whoami /user prints user only, so this is
+  # belt-and-braces against output bleed.)
+  throw "R1: discriminator SID found in child whoami. raw: $($r.raw)"
+}
+Write-Host "R1 ok: two-hop child runs as srt-sandbox (sid=$($row.SID))"
+
+# ── R2: stdio piped broker ← runner ← child ─────────────────────
+$r = RExec @('--', $cmd, '/c', 'echo R2-STDOUT-MARK & echo R2-STDERR-MARK 1>&2')
+if ($r.out -notmatch 'R2-STDOUT-MARK') {
+  throw "R2: stdout marker missing. raw: $($r.raw)"
+}
+if ($r.raw -notmatch 'R2-STDERR-MARK') {
+  throw "R2: stderr marker missing. raw: $($r.raw)"
+}
+Write-Host 'R2 ok: stdout+stderr piped through runner to broker'
+
+# ── R3: exit code propagates broker ← runner ← child ────────────
+$r = RExec @('--', $cmd, '/c', 'exit 23')
+if ($r.exit -ne 23) {
+  throw "R3: expected exit 23, got $($r.exit). raw: $($r.raw)"
+}
+Write-Host 'R3 ok: child exit code propagates through runner'
+
+# ── R4: env-merge — USERPROFILE isolated, PATH overlaid ─────────
+# LOGON_WITH_PROFILE gives the runner the sandbox user's profile
+# env (USERPROFILE/TEMP under C:\Users\srt-sandbox). The broker's
+# PATH is overlaid via the spec so tools resolve. Probe both.
+$r = RExec @('--', $cmd, '/c', 'echo UP=%USERPROFILE%& echo PATH=%PATH%')
+if ($r.out -notmatch '(?i)UP=.*srt-sandbox') {
+  throw "R4: USERPROFILE not isolated to srt-sandbox. out: $($r.out)"
+}
+if ($r.out -notmatch '(?i)PATH=.*System32') {
+  throw "R4: PATH overlay missing System32. out: $($r.out)"
+}
+Write-Host 'R4 ok: USERPROFILE isolated, broker PATH overlaid'
+
+# ── R5: outbound blocked by F-USER-BLOCK ────────────────────────
+# The user-SID WFP filter (installed by `srt-win install` above)
+# blocks all srt-sandbox egress except in-range loopback. No proxy
+# env in this row, so the child's direct curl must fail.
+$r = RExec @('--', $cmd, '/c', 'curl -sS -m 5 https://example.com')
+if ($r.exit -eq 0) {
+  throw "R5: outbound curl succeeded under --as-sandbox-user " +
+        "(F-USER-BLOCK not in effect?). out: $($r.out)"
+}
+Write-Host "R5 ok: outbound blocked for srt-sandbox (curl exit=$($r.exit))"
+
+# ── R5b: in-range loopback permitted (the via-proxy half) ────────
+# F-USER-LOOPBACK permits srt-sandbox → 127.0.0.1:<port∈range>; the
+# JS proxy binds there. R5 proved the BLOCK; this proves the PERMIT
+# the proxy path rides on. (The e2e curl-via-proxy → 200 lives in
+# winsrt.test.ts H-rows where the JS proxy actually runs.)
+$inRangeR = Bind-Listener ($PortHi..($PortLo+5))
+$portInR  = $inRangeR.LocalEndpoint.Port
+try {
+  $r = RExec @('--', $pwsh, '-NoProfile', '-Command',
+    "(Test-NetConnection 127.0.0.1 -Port $portInR " +
+    "-WarningAction SilentlyContinue).TcpTestSucceeded")
+  if ($r.out -notmatch '(?i)\bTrue\b') {
+    throw "R5b: loopback to in-range port $portInR did not succeed " +
+          "(F-USER-LOOPBACK not in effect?). raw: $($r.raw)"
+  }
+  Write-Host "R5b ok: in-range loopback permitted for srt-sandbox (port=$portInR)"
+} finally {
+  $inRangeR.Stop()
+}
+
+# ── R9: child cannot OpenProcess(PROCESS_CREATE_PROCESS) on a ────
+#        real-user process (cross-user boundary)
+# ── R9b: child cannot OpenProcess(PROCESS_CREATE_PROCESS) on the ─
+#        RUNNER (runner self-protect — would let the child
+#        PROC_THREAD_ATTRIBUTE_PARENT_PROCESS-spawn under the
+#        runner's unrestricted token and escape job/winsta/mitigations)
+# R9 targets THIS pwsh process (real user, default DACL — same role
+# explorer.exe plays on a desktop session; the GHA runner may not
+# have explorer running). R9b finds the runner by walking the
+# child's parent chain to the first srt-win.exe.
+$hostPid = $PID
+$probeR9 = @"
+`$sig = '[DllImport("kernel32.dll",SetLastError=true)]public static extern System.IntPtr OpenProcess(uint a,bool b,uint p);'
+`$k32 = Add-Type -MemberDefinition `$sig -Name K32R -Namespace W -PassThru
+function Probe([string]`$tag, [int]`$targetPid) {
+  # 0x0080 = PROCESS_CREATE_PROCESS
+  `$h = `$k32::OpenProcess(0x0080, `$false, `$targetPid)
+  `$le = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+  if (`$h -ne [System.IntPtr]::Zero) { "OPENED:`$tag pid=`$targetPid" }
+  elseif (`$le -eq 5)                { "DENIED:`$tag pid=`$targetPid" }
+  else                               { "OTHER:`$tag pid=`$targetPid le=`$le" }
+}
+`$rp = 0
+`$cur = `$PID
+for (`$i = 0; `$i -lt 8; `$i++) {
+  `$p = Get-CimInstance Win32_Process -Filter "ProcessId=`$cur" -ea SilentlyContinue
+  if (-not `$p) { break }
+  if (`$p.Name -eq 'srt-win.exe') { `$rp = [int]`$p.ProcessId; break }
+  if (-not `$p.ParentProcessId) { break }
+  `$cur = `$p.ParentProcessId
+}
+Probe 'real-user' $hostPid
+if (`$rp -eq 0) { 'NORUNNER' } else { Probe 'runner' `$rp }
+"@
+$r = RExec @('--', $pwsh, '-NoProfile', '-Command', $probeR9)
+Write-Host "R9 probe output: $($r.out.Trim())"
+if ($r.out -match 'OPENED:real-user') {
+  throw "R9: child got PROCESS_CREATE_PROCESS on a real-user " +
+        "process (cross-user boundary breached). raw: $($r.raw)"
+}
+if ($r.out -notmatch 'DENIED:real-user') {
+  throw "R9: expected ACCESS_DENIED for real-user target. raw: $($r.raw)"
+}
+Write-Host 'R9 ok: child denied PROCESS_CREATE_PROCESS on real-user process'
+if ($r.out -match 'NORUNNER') {
+  throw "R9b: runner discovery failed. raw: $($r.raw)"
+}
+if ($r.out -match 'OPENED:runner') {
+  throw "R9b: child got PROCESS_CREATE_PROCESS on the runner " +
+        "(runner self-protect ineffective — sandbox escape). raw: $($r.raw)"
+}
+if ($r.out -notmatch 'DENIED:runner') {
+  throw "R9b: expected ACCESS_DENIED for runner target. raw: $($r.raw)"
+}
+Write-Host 'R9b ok: child denied PROCESS_CREATE_PROCESS on the runner (self-protect holds)'
+
+# ── R6: child cannot read state.db (sandbox-runtime-users DENY) ──
+$stateDb = Join-Path $env:LOCALAPPDATA 'sandbox-runtime\state.db'
+if (-not (Test-Path $stateDb)) { throw "R6: $stateDb missing" }
+$r = RExec @('--', $cmd, '/c', "type `"$stateDb`"")
+if ($r.exit -eq 0) {
+  throw "R6: child READ state.db (DENY ACE not in effect?). raw: $($r.raw)"
+}
+if ($r.raw -notmatch '(?i)access is denied') {
+  throw "R6: expected Access is denied. raw: $($r.raw)"
+}
+Write-Host 'R6 ok: child cannot read state.db (cred file gate holds)'
+
+# (CA trust is install-time, not per-exec — covered in smoke.ps1.)
+
+# ── R8: exec --as-sandbox-user without provisioning → exit 15 ────
+# Clear the cred row (uninstall does this) and assert the broker
+# refuses with the dedicated exit code instead of failing the
+# logon. Re-install afterward is unnecessary — teardown follows.
+Run @('uninstall','--sublayer-guid',$Sublayer)
+$r = & $Exe exec --group-sid $GroupSid --sublayer-guid $Sublayer `
+        --skip-wfp-check --as-sandbox-user -- $cmd /c 'exit 0' 2>&1 | Out-String
+if ($LASTEXITCODE -ne 15) {
+  throw "R8: expected exit 15 (not provisioned), got ${LASTEXITCODE}. out: $r"
+}
+if ($r -notmatch '(?i)srt-win install') {
+  throw "R8: expected re-run install hint. out: $r"
+}
+Write-Host 'R8 ok: --as-sandbox-user exits 15 with install hint when not provisioned'
+
 # ── teardown ─────────────────────────────────────────────────────
-Run @('wfp','uninstall','--sublayer-guid',$Sublayer)
+# `uninstall` (R8) already removed filters + user. Belt-and-braces
+# wfp uninstall for the case where R-rows were skipped or threw
+# before R8.
+& $Exe wfp uninstall --sublayer-guid $Sublayer 2>&1 | Out-Null
 $post = J @('wfp','status','--sublayer-guid',$Sublayer)
 if ($post.state -ne 'absent') {
   throw "post-uninstall expected absent, got $($post.state)"
 }
-Write-Host 'smoke-exec: PASS (E1-E11c incl. E4b/E7b/E7c)'
+Write-Host 'smoke-exec: PASS (E1-E11c incl. E4b/E7b/E7c, R1-R6/R8/R9/R9b incl. R5b)'
