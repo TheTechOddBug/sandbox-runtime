@@ -45,6 +45,8 @@ import {
   expandWindowsFsDenyPaths,
   stampWindowsAcl,
   restoreWindowsAcl,
+  grantWindowsAcl,
+  revokeWindowsAcl,
   getWindowsSandboxUserStatus,
   getWindowsSandboxCaCert,
   verifyWindowsWfpEgress,
@@ -59,7 +61,6 @@ import {
   containsGlobChars,
   removeTrailingGlobSuffix,
   expandGlobPattern,
-  normalizePathForSandbox,
 } from './sandbox-utils.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
 import type { MutateForwardedHeaders } from './request-filter.js'
@@ -98,19 +99,24 @@ let mitmCA: MitmCA | undefined
 // the sandbox child env, checked on every CONNECT/request — so a host process
 // dialing 127.0.0.1:<proxyPort> can't reach the filter callback.
 let proxyAuthToken: string | undefined
-// Windows: the resolved {denyRead, denyWrite} that was actually
-// passed to `srt-win acl stamp` at initialize(). `undefined` means
-// no stamp was applied (gates passing `--holder-pid` to exec —
-// which engages the per-exec dir/file fence — and running `acl
-// restore` at reset()).
+// Windows: the resolved access set that was actually applied at
+// initialize(). `undefined` means no stamp/grant was applied
+// (gates passing `--holder-pid` to exec — which engages the
+// per-exec dir/file fence — and running `acl restore`/`acl revoke`
+// at reset()).
 let windowsFsStampedSet:
-  | { denyRead: readonly string[]; denyWrite: readonly string[] }
+  | ReturnType<typeof computeWindowsFsAccessSet>
   | undefined
 // The group reference that was passed to `srt-win acl stamp`.
 // reset() restores against THIS, not the current config — a
 // group change between stamp and restore would otherwise
 // target the wrong group's broker DACL.
 let windowsFsStampedGroup: WindowsGroupRef | undefined
+// SIDs captured at initialize() under `asSandboxUser`: the sandbox
+// user (revoke target) and the real user (stamp trustee). reset()
+// uses these so a config change between init and reset can't strand
+// state under a different SID.
+let windowsFsSbUserSids: { sb: string } | undefined
 // The RAW config inputs that produced `windowsFsStampedSet`.
 // updateConfig() compares these (not the resolved set) so it never
 // re-expands globs — see `sameWindowsStampSet`.
@@ -502,31 +508,78 @@ async function initialize(
       throw e
     }
     try {
-      const deny = computeWindowsFsDenySet(runtimeConfig)
-      if (deny.denyRead.length > 0 || deny.denyWrite.length > 0) {
-        const group = getWindowsGroupRef()
+      const acc = computeWindowsFsAccessSet(runtimeConfig)
+      const group = getWindowsGroupRef()
+      const asSbUser = runtimeConfig.windows?.asSandboxUser ?? false
+      // Under separate-user, grant FIRST so the sandbox user has
+      // working-tree access by the time the stamp runs (the stamp
+      // PROTECTEDs paths inside it). The two are independent
+      // refcounted state-DB sets keyed on the same holder PID.
+      let sids: { sb: string } | undefined
+      if (asSbUser) {
+        const u = getWindowsSandboxUserStatus()
+        if (!u.sid) {
+          throw new Error(
+            'windows.asSandboxUser: sandbox user SID missing from ' +
+              '`srt-win user status` (provisioned but in an inconsistent state)',
+          )
+        }
+        sids = { sb: u.sid }
+        // Record module-level state BEFORE the first acl call so the
+        // catch's best-effort revoke/restore can address whatever
+        // partially landed.
+        windowsFsSbUserSids = sids
+        if (acc.grantRead.length > 0 || acc.grantWrite.length > 0) {
+          grantWindowsAcl({
+            group,
+            sandboxUserSid: sids.sb,
+            read: acc.grantRead,
+            write: acc.grantWrite,
+          })
+        }
+      }
+      if (acc.denyRead.length > 0 || acc.denyWrite.length > 0) {
         stampWindowsAcl({
           group,
-          denyRead: deny.denyRead,
-          denyWrite: deny.denyWrite,
+          denyRead: acc.denyRead,
+          denyWrite: acc.denyWrite,
+          ...(asSbUser && sids ? { sandboxUserSid: sids.sb } : {}),
         })
-        // Only record the set AFTER a successful stamp — the
-        // catch below clears `config`, and a non-undefined
-        // stampedSet would leave reset()/updateConfig() seeing a
-        // stamp that never landed.
-        windowsFsStampedSet = deny
+      }
+      // Only record when something was actually applied — gates
+      // passing `--holder-pid` to exec (per-exec deny self-registers
+      // under its own PID when there is no session-level holder) and
+      // running revoke/restore at reset(). Recorded AFTER success —
+      // the catch below clears `config`, and a non-undefined
+      // stampedSet would leave reset()/updateConfig() seeing state
+      // that never landed.
+      const anyApplied =
+        acc.grantRead.length > 0 ||
+        acc.grantWrite.length > 0 ||
+        acc.denyRead.length > 0 ||
+        acc.denyWrite.length > 0
+      if (anyApplied) {
+        windowsFsStampedSet = acc
         windowsFsStampedGroup = group
         logForDebugging(
-          `[Sandbox Windows] file deny stamped: ` +
-            `${deny.denyRead.length} denyRead, ${deny.denyWrite.length} denyWrite`,
+          `[Sandbox Windows] fs applied: ` +
+            `${acc.grantWrite.length} grantWrite, ` +
+            `${acc.grantRead.length} grantRead, ` +
+            `${acc.denyRead.length} denyRead, ` +
+            `${acc.denyWrite.length} denyWrite`,
         )
       }
       windowsFsRawInputs = rawWindowsFsInputs(runtimeConfig)
     } catch (e) {
-      // Best-effort release of whatever WAS stamped before the
-      // failure (exit-2 partial stamps the resolvable inputs;
-      // harmless if nothing was stamped — no holds for this PID).
-      restoreWindowsAcl({ group: getWindowsGroupRef() })
+      // Best-effort release of whatever WAS applied before the
+      // failure (exit-2 partial stamps/grants the resolvable
+      // inputs; harmless if nothing was — no holds for this PID).
+      const g = getWindowsGroupRef()
+      if (windowsFsSbUserSids) {
+        revokeWindowsAcl({ group: g, sandboxUserSid: windowsFsSbUserSids.sb })
+      }
+      restoreWindowsAcl({ group: g, sandboxUserSid: windowsFsSbUserSids?.sb })
+      windowsFsSbUserSids = undefined
       config = undefined
       throw e
     }
@@ -869,24 +922,35 @@ function getFsWriteConfig(): FsWriteRestrictionConfig {
 }
 
 /**
- * Build the Windows file-deny set from `runtimeConfig`. Globs are
- * expanded to concrete file paths (point-in-time — a file
- * appearing after this returns is NOT covered). Throws on any
- * directory match (file-only for now) and on any unsupported
- * config field that would otherwise be silently dropped.
+ * Build the Windows file-access set (deny stamps + sandbox-user
+ * grants) from `runtimeConfig`. Globs are expanded to concrete
+ * paths (point-in-time — a path appearing after this returns is NOT
+ * covered). Directory handling is per-mode (see below). Throws on
+ * any unsupported config field that would otherwise be silently
+ * dropped.
  *
  * `denyRead` ← `filesystem.denyRead` ∪ `credentials`-derived deny
  *              paths (via {@link getCredentialDenyReadPaths}).
  * `denyWrite` ← `filesystem.denyWrite`.
  *
- * Not supported on Windows (throws if non-empty so the caller
- * never silently runs with a weaker-than-configured policy):
- *   - `filesystem.allowRead` (re-allow within a denied region)
- *   - `filesystem.allowWrite` as a write allow-list — the Windows
- *     backend is deny-listed only; the sandboxed child writes
- *     wherever the host user can, minus `denyWrite`.
+ * Under the **same-user model** (the default), `allowRead` /
+ * `allowWrite` are not supported (throws if non-empty so the
+ * caller never silently runs with a weaker-than-configured policy)
+ * — the same-user backend is deny-listed only.
+ *
+ * Under the **separate-user model** (`windows.asSandboxUser`), the
+ * sandbox user has no inherent rights on real-user-owned files,
+ * so `allowWrite` (the working-tree roots) becomes a per-session
+ * `MODIFY_NO_FDC` ALLOW ACE for `<sb-SID>`, `allowRead` a
+ * `READ|EXECUTE` ALLOW ACE, and `denyRead`/`denyWrite` become an
+ * explicit DENY ACE for `<sb-SID>` on the target plus a
+ * `(OI)(CI) FILE_DELETE_CHILD` DENY on its parent. Directory
+ * targets are accepted in this mode (the `(OI)(CI)` ACEs cover the
+ * subtree).
  */
-function computeWindowsFsDenySet(c: SandboxRuntimeConfig): {
+function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
+  grantRead: string[]
+  grantWrite: string[]
   denyRead: string[]
   denyWrite: string[]
 } {
@@ -894,54 +958,69 @@ function computeWindowsFsDenySet(c: SandboxRuntimeConfig): {
   // filesystem.disabled bypasses ALL filesystem rule generation —
   // same as the macOS/Linux wrapWithSandbox path (readConfig /
   // writeConfig left undefined). On Windows this means no ACL
-  // stamp; credential FILE denies are dropped along with the rest
-  // (credential ENV scrubbing is independent and still applied at
-  // wrap time). Returning empty here means initialize() applies no
-  // stamp.
+  // stamp/grant; credential FILE denies are dropped along with the
+  // rest (credential ENV scrubbing is independent and still applied
+  // at wrap time).
   if (fs?.disabled) {
-    return { denyRead: [], denyWrite: [] }
+    return { grantRead: [], grantWrite: [], denyRead: [], denyWrite: [] }
   }
-  if (fs?.allowRead?.length) {
-    throw new Error(
-      `filesystem.allowRead (re-allow within denyRead) is not supported ` +
-        `on Windows. Remove the entries or narrow filesystem.denyRead to ` +
-        `exclude them.`,
-    )
+  const asSbUser = c.windows?.asSandboxUser ?? false
+  if (!asSbUser) {
+    if (fs?.allowRead?.length) {
+      throw new Error(
+        `filesystem.allowRead is not supported on Windows without ` +
+          `windows.asSandboxUser. Remove the entries or narrow ` +
+          `filesystem.denyRead to exclude them.`,
+      )
+    }
+    if (fs?.allowWrite?.length) {
+      throw new Error(
+        `filesystem.allowWrite is not supported on Windows without ` +
+          `windows.asSandboxUser — the same-user backend is deny-listed ` +
+          `only. Remove the allowWrite entries or set windows.asSandboxUser.`,
+      )
+    }
   }
-  if (fs?.allowWrite?.length) {
-    throw new Error(
-      `filesystem.allowWrite is not supported on Windows — the Windows ` +
-        `sandbox is deny-listed only (the child writes wherever the host ` +
-        `user can, minus filesystem.denyWrite). Remove the allowWrite ` +
-        `entries.`,
-    )
-  }
-  const denyRead = expandWindowsFsDenyPaths([
+  const expand = (p: readonly string[]) =>
+    expandWindowsFsDenyPaths(p, { allowDirs: asSbUser })
+  const denyRead = expand([
     ...new Set([
       ...(fs?.denyRead ?? []),
       ...getCredentialDenyReadPaths(c.credentials),
     ]),
   ])
-  const denyWrite = expandWindowsFsDenyPaths(fs?.denyWrite ?? [])
-  return { denyRead, denyWrite }
+  const denyWrite = expand(fs?.denyWrite ?? [])
+  return {
+    // Grants are separate-user-mode only — same-user already has
+    // full host-user access (and `allowRead`/`allowWrite` threw
+    // above). `allowRead` under SandboxUser also serves as
+    // `allowWithinDeny`: a file under a denied dir gets an explicit
+    // ACE for the sandbox user, overriding what it would inherit
+    // from the PROTECTED parent.
+    grantRead: asSbUser ? expand(fs?.allowRead ?? []) : [],
+    grantWrite: asSbUser ? expand(fs?.allowWrite ?? []) : [],
+    denyRead,
+    denyWrite,
+  }
 }
 
 /**
  * Snapshot the raw config fields that feed
- * {@link computeWindowsFsDenySet}. Used by updateConfig() to
+ * {@link computeWindowsFsAccessSet}. Used by updateConfig() to
  * short-circuit the resolved-set diff (which re-runs glob
  * expansion) when nothing relevant changed.
  */
 function rawWindowsFsInputs(c: SandboxRuntimeConfig) {
-  // Keyed exactly on what {@link computeWindowsFsDenySet} reads:
-  // disabled, denyRead, denyWrite, and the credential file-deny
-  // paths. `network.allowedDomains` does NOT feed file-deny
-  // (only mask injectHosts), so a network-only updateConfig
-  // hits the cache.
+  // Keyed exactly on what {@link computeWindowsFsAccessSet} reads.
+  // `network.allowedDomains` does NOT feed file-deny (only mask
+  // injectHosts), so a network-only updateConfig hits the cache.
   return {
     disabled: c.filesystem.disabled ?? false,
+    asSbUser: c.windows?.asSandboxUser ?? false,
     denyRead: [...c.filesystem.denyRead],
     denyWrite: [...c.filesystem.denyWrite],
+    allowRead: [...(c.filesystem.allowRead ?? [])],
+    allowWrite: [...c.filesystem.allowWrite],
     credFiles: getCredentialDenyReadPaths(c.credentials),
   }
 }
@@ -952,8 +1031,11 @@ function sameRawWindowsFsInputs(
 ): boolean {
   return (
     a.disabled === b.disabled &&
+    a.asSbUser === b.asSbUser &&
     setEq(a.denyRead, b.denyRead) &&
     setEq(a.denyWrite, b.denyWrite) &&
+    setEq(a.allowRead, b.allowRead) &&
+    setEq(a.allowWrite, b.allowWrite) &&
     setEq(a.credFiles, b.credFiles)
   )
 }
@@ -1327,15 +1409,12 @@ async function wrapWithSandboxArgv(
     )
     // Per-exec FILE denies (customConfig only — the session-level
     // config's denies were already stamped at initialize()).
-    // Unlike the session-level set, paths are passed through
-    // VERBATIM (normalized only): no glob expansion, no
-    // existsSync filter. `srt-win exec`'s
-    // `canonicalize_deny_targets` is the authority — it
-    // hard-fails on glob/dir/nonexistent so a missing path is a
-    // visible caller error, not a silent skip (the session-level
-    // expand-and-drop-missing was for tolerant point-in-time
-    // globs at init; per-exec is "deny THIS one command" and a
-    // path that doesn't resolve is a bug the caller must see).
+    // Paths go through `expandWindowsFsDenyPaths` — the SAME
+    // chokepoint the session-level set uses (point-in-time glob
+    // expand, normalize, missing→drop, dir→throw under
+    // same-user) — so a per-exec entry resolves identically to
+    // its session-level equivalent. macOS/Linux per-exec already
+    // reuses session-level expansion; Windows now matches.
     //
     // The dedup against `windowsFsStampedSet` is an OPTIMIZATION,
     // not a correctness gate: re-stamping a session-held path
@@ -1347,7 +1426,7 @@ async function wrapWithSandboxArgv(
     //
     // filesystem.disabled bypasses ALL filesystem rule generation
     // — including credential-derived file denies — same ordering
-    // as session-level `computeWindowsFsDenySet` (credential ENV
+    // as session-level `computeWindowsFsAccessSet` (credential ENV
     // scrubbing is independent and still applied at wrap time).
     // allowRead/allowWrite throw, also matching session-level:
     // the Windows file-deny sandbox is deny-only.
@@ -1377,17 +1456,17 @@ async function wrapWithSandboxArgv(
       const rawWrite = fsCfg?.denyWrite ?? []
       // Skip on the dominant path (no per-exec fs or
       // credential-file deny) — this used to call
-      // `computeWindowsFsDenySet` (glob walk + statSync per
+      // `computeWindowsFsAccessSet` (glob walk + statSync per
       // match) on every exec, including with
       // `customConfig === undefined`.
       if (rawRead.length > 0 || rawWrite.length > 0) {
         const sessRead = new Set(windowsFsStampedSet?.denyRead ?? [])
         const sessWrite = new Set(windowsFsStampedSet?.denyWrite ?? [])
-        const norm = (raw: readonly string[]) => [
-          ...new Set(raw.map(normalizePathForSandbox)),
-        ]
-        perExecDenyRead = norm(rawRead).filter(p => !sessRead.has(p))
-        perExecDenyWrite = norm(rawWrite).filter(
+        const asSbUser = config?.windows?.asSandboxUser ?? false
+        const expand = (raw: readonly string[]) =>
+          expandWindowsFsDenyPaths(raw, { allowDirs: asSbUser })
+        perExecDenyRead = expand(rawRead).filter(p => !sessRead.has(p))
+        perExecDenyWrite = expand(rawWrite).filter(
           p => !sessRead.has(p) && !sessWrite.has(p),
         )
       }
@@ -1404,7 +1483,7 @@ async function wrapWithSandboxArgv(
     // e.g. HTTPS_PROXY as a denied credential). The `denyReadPaths`
     // half of the SESSION-level credentials is already unioned into
     // the stamp set at initialize() time via
-    // `computeWindowsFsDenySet`.
+    // `computeWindowsFsAccessSet`.
     return wrapCommandWithSandboxWindows({
       command,
       group: getWindowsGroupRef(),
@@ -1646,8 +1725,24 @@ async function reset(): Promise<void> {
   // marker means a stamp left in place is recoverable later via
   // `srt-win acl recover`.
   if (windowsFsStampedSet) {
+    const group = windowsFsStampedGroup ?? getWindowsGroupRef()
+    if (windowsFsSbUserSids) {
+      const rv = revokeWindowsAcl({
+        group,
+        sandboxUserSid: windowsFsSbUserSids.sb,
+      })
+      for (const e of rv ?? []) {
+        if (e.status !== 'revoked' && e.status !== 'stillHeld') {
+          logForDebugging(
+            `[Sandbox Windows] grant revoke: '${e.path}' ${e.status}`,
+            { level: 'warn' },
+          )
+        }
+      }
+    }
     const r = restoreWindowsAcl({
-      group: windowsFsStampedGroup ?? getWindowsGroupRef(),
+      group,
+      sandboxUserSid: windowsFsSbUserSids?.sb,
     })
     if (r) {
       for (const e of r.paths ?? []) {
@@ -1679,6 +1774,7 @@ async function reset(): Promise<void> {
   }
   windowsFsStampedSet = undefined
   windowsFsStampedGroup = undefined
+  windowsFsSbUserSids = undefined
   windowsFsRawInputs = undefined
   windowsWfpVerified = false
 

@@ -242,11 +242,12 @@ pub fn run_lockdown(
     //    containment Job; the child must NOT be able to break away.
     let job = Job::new(false).context("Job::new")?;
 
-    // `on_default` gates the IsolatedDesk creation (BOTH modes); the
+    // `on_default` gates step 5's per-mode desktop handling; the
     // breakaway flag is gated separately on the launch mode. Computed
-    // (and logged) BEFORE step 5 so the diagnostic survives an
-    // IsolatedDesk failure.
-    let on_default = on_default_desktop();
+    // (and logged) BEFORE step 5 so the diagnostic identifies which
+    // desktop the caller landed on.
+    let on_default = on_default_desktop()
+        .context("read current desktop name (isolation gate)")?;
     let caller_in_job =
         is_process_in_job(unsafe { GetCurrentProcess() }, None);
     // Breakaway: on `SandboxUser` the caller is in seclogon's job
@@ -267,7 +268,7 @@ pub fn run_lockdown(
              child_desk={} breakaway={}",
             caller_in_job,
             current_winsta_name().ok().as_deref().unwrap_or("?"),
-            current_desktop_name().as_deref().unwrap_or("?"),
+            current_desktop_name().ok().as_deref().unwrap_or("?"),
             if on_default { "fresh" } else { "inherit" },
             breakaway.0 != 0,
         );
@@ -275,52 +276,38 @@ pub fn run_lockdown(
 
     // 5) Isolated desktop. A fresh desktop on the caller's window
     //    station isolates the child from `Default` (shatter / WM_*
-    //    injection / window enumeration — message queues are
-    //    per-desktop). Desktop-only, NOT a fresh window station:
-    //    `CreateWindowStationW` is admin-gated on a standard
-    //    interactive session; `CreateDesktopW` works non-elevated and
-    //    the Job's UI limits already cover what a separate station
-    //    would add (clipboard / global atoms). BOTH modes create here
-    //    when the caller is on `WinSta0\Default` — on `SandboxUser`
-    //    the runner lands on `Default` (CPWLW with `lpDesktop =
-    //    NULL`; seclogon auto-grants the sandbox-user logon access to
-    //    `WinSta0` including `WINSTA_CREATEDESKTOP`). When the caller
-    //    is already off `Default` (e.g. a `SameUser` broker that was
-    //    itself spawned onto a non-interactive desktop) the isolation
-    //    is in place; skip and let the child inherit.
+    //    injection / window enumeration / `WH_KEYBOARD_LL` keylogging
+    //    — message queues are per-desktop, and the Job's
+    //    `UILIMIT_HANDLES` does NOT gate low-level hooks).
+    //    Desktop-only, NOT a fresh window station:
+    //    `CreateWindowStationW` is admin-gated; `CreateDesktopW`
+    //    works non-elevated and the Job's UI limits already cover
+    //    what a separate station would add (clipboard / global
+    //    atoms). See `winsta.rs` module doc.
     //
-    //    `SandboxUser` only — best-effort: if `CreateDesktopW` is
-    //    denied (a host whose seclogon grant is narrower than
-    //    expected), the Job's UI limits remain the fence — weaker
-    //    than per-desktop but still the documented surface. On
-    //    `SameUser` the broker creates desktops on its own station
-    //    by definition, so an ACCESS_DENIED is an unexpected ACL
-    //    change and propagates (fail-closed, parity with the
-    //    pre-two-hop behaviour). Any other error propagates on
-    //    both modes.
-    let mut desk = if on_default {
-        match IsolatedDesk::new() {
-            Ok(d) => Some(d),
-            Err(e)
-                if sandbox_user
-                    && e.chain().any(|c| {
-                        c.downcast_ref::<windows::core::Error>()
-                            .is_some_and(|we| {
-                                we.code().0 as u32 == 0x8007_0005
-                            })
-                    }) =>
-            {
-                eprintln!(
-                    "srt-win: WARNING: IsolatedDesk::new: {e:#} — \
-                     child stays on the caller's desktop (Job UI \
-                     limits still apply)"
-                );
-                None
-            }
-            Err(e) => return Err(e.context("IsolatedDesk::new")),
+    //    `SameUser`: create here when on `Default` (the broker
+    //    creates desktops on its own station by definition; any error
+    //    propagates fail-closed). When already off `Default` the
+    //    isolation is in place; skip and let the child inherit.
+    //
+    //    `SandboxUser`: the broker created `WinSta0\srt-sb-…` and
+    //    passed it via `lpDesktop` to `CreateProcessWithLogonW`, so
+    //    this runner is already on it. The child inherits via
+    //    `lpDesktop = NULL` in step 9. If we're still on `Default`,
+    //    the broker-side creation/attach failed and the child would
+    //    share the interactive desktop — refuse rather than fall
+    //    through.
+    let mut desk = match (mode, on_default) {
+        (LaunchMode::SandboxUser { .. }, true) => {
+            return Err(anyhow!(
+                "desktop isolation required: runner is on Default — \
+                 broker IsolatedDesk creation or WinSta0 grant failed"
+            ));
         }
-    } else {
-        None
+        (LaunchMode::SameUser { .. }, true) => {
+            Some(IsolatedDesk::new(None).context("IsolatedDesk::new")?)
+        }
+        (_, false) => None,
     };
 
     // 6) Env block — this process's own environment (verbatim) with
@@ -373,6 +360,9 @@ pub fn run_lockdown(
         six.StartupInfo.hStdError = std_handles[2];
     }
     six.lpAttributeList = attrs.list();
+    // `SameUser` only — `SandboxUser` leaves `lpDesktop = NULL`
+    // (zeroed) so the child inherits this runner's station+desktop,
+    // which is the broker-created `srt-sb-…` per step 5's assertion.
     if let Some(d) = &mut desk {
         six.StartupInfo.lpDesktop = PWSTR(d.desktop_name_ptr());
     }

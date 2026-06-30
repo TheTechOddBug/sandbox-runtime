@@ -135,6 +135,11 @@ export interface WindowsSandboxUserStatus {
   /** Setup marker schema version, when the marker row exists. */
   markerVersion?: number
   /**
+   * The calling (real) user's SID — the trustee for `acl stamp`
+   * under the separate-user model. Always present.
+   */
+  realUserSid: string
+  /**
    * SHA-1 thumbprint of the install-time CA, when one was
    * installed via `srt-win user trust-ca`. Uppercase hex.
    */
@@ -253,12 +258,11 @@ export interface WindowsSandboxParams {
    * {@link stampWindowsAcl}; same fail-closed semantics (exec
    * fails if any path cannot be stamped).
    *
-   * Pass RAW normalized paths. Do NOT pre-filter or pre-expand
-   * via {@link expandWindowsFsDenyPaths} — `srt-win exec`'s
-   * `canonicalize_deny_targets` is the sole authority for
-   * glob/dir/nonexistent rejection (hard-fail). A missing path
-   * is a caller error, not a skip; pre-filtering would silently
-   * drop it and run the child with the file readable.
+   * Normalized concrete paths — globs expanded by the caller via
+   * {@link expandWindowsFsDenyPaths}, the same as session-level.
+   * `srt-win exec`'s `canonicalize_deny_targets` hard-fails on a
+   * glob (it never expands), so a `*`/`?` reaching this field is
+   * a caller bug.
    */
   denyRead?: readonly string[]
   /** Per-exec write-deny paths — see {@link denyRead}. */
@@ -620,6 +624,7 @@ export function getWindowsSandboxUserStatus(): WindowsSandboxUserStatus {
     }
     cred_present: boolean
     marker_version?: number | null
+    real_user_sid: string
     ca_cert_thumb?: string | null
     ca_cert_pem?: string | null
   }>(['user', 'status'])
@@ -635,6 +640,7 @@ export function getWindowsSandboxUserStatus(): WindowsSandboxUserStatus {
     ...(typeof raw.marker_version === 'number' && {
       markerVersion: raw.marker_version,
     }),
+    realUserSid: raw.real_user_sid,
     ...(raw.ca_cert_thumb && { caCertThumb: raw.ca_cert_thumb }),
     ...(raw.ca_cert_pem && { caCertPem: raw.ca_cert_pem }),
   }
@@ -1001,6 +1007,7 @@ export interface WindowsAclRestoreResult {
  */
 export function expandWindowsFsDenyPaths(
   patterns: readonly string[],
+  opts: { allowDirs?: boolean } = {},
 ): string[] {
   const out = new Set<string>()
   for (const raw of patterns) {
@@ -1011,11 +1018,12 @@ export function expandWindowsFsDenyPaths(
     for (const c of candidates) {
       const st = fs.statSync(c, { throwIfNoEntry: false })
       if (!st) continue
-      if (st.isDirectory()) {
+      if (st.isDirectory() && !opts.allowDirs) {
         throw new Error(
           `Windows fs deny requires explicit file paths; ` +
             `${JSON.stringify(raw)} resolved to directory ` +
-            `${JSON.stringify(c)}. Directory targets are not supported.`,
+            `${JSON.stringify(c)}. Directory targets are only ` +
+            `supported under windows.asSandboxUser.`,
         )
       }
       out.add(c)
@@ -1026,12 +1034,22 @@ export function expandWindowsFsDenyPaths(
 
 export interface WindowsAclStampOptions {
   group: WindowsGroupRef
-  /** Files the sandboxed child must not read. */
+  /** Paths the sandboxed child must not read. */
   denyRead: readonly string[]
-  /** Files the sandboxed child must not write (read stays allowed). */
+  /** Paths the sandboxed child must not write (read stays allowed). */
   denyWrite: readonly string[]
   /** Long-lived host PID the holds are tied to. Default: this process. */
   holderPid?: number
+  /**
+   * Under the separate-user model, the sandbox user's SID
+   * ({@link WindowsSandboxUserStatus.sid}). Switches the stamp to
+   * an additive `(D;OICI;mask;;;<sb-SID>)` ACE on the target plus a
+   * `(D;OICI;FILE_DELETE_CHILD;;;<sb-SID>)` on the parent — no
+   * PROTECTED rewrite, no SD snapshot. When omitted (same-user
+   * model), the PROTECTED broker-only stamp keyed on the
+   * discriminator group is applied.
+   */
+  sandboxUserSid?: string
 }
 
 /**
@@ -1057,11 +1075,17 @@ export function stampWindowsAcl(opts: WindowsAclStampOptions): void {
     denyRead: opts.denyRead,
     denyWrite: opts.denyWrite,
   })
-  const r = runSrtWin(
-    ['acl', 'stamp', ...groupRefArgs(opts.group), '--holder-pid', `${holder}`],
-    stdin,
-    60_000,
-  )
+  const args = [
+    'acl',
+    'stamp',
+    ...groupRefArgs(opts.group),
+    '--holder-pid',
+    `${holder}`,
+  ]
+  if (opts.sandboxUserSid) {
+    args.push('--sandbox-user-sid', opts.sandboxUserSid)
+  }
+  const r = runSrtWin(args, stdin, 60_000)
   logForDebugging(
     `[Sandbox Windows] acl stamp exit=${r.status}: ${r.stderr || r.stdout}`,
   )
@@ -1080,6 +1104,13 @@ export interface WindowsAclRestoreOptions {
   group: WindowsGroupRef
   /** Long-lived host PID whose holds to release. Default: this process. */
   holderPid?: number
+  /**
+   * Under the separate-user model, the sandbox user's SID — must
+   * match {@link WindowsAclStampOptions.sandboxUserSid}. Switches
+   * restore to `REVOKE_ACCESS` for the SID instead of the
+   * SD-snapshot restore.
+   */
+  sandboxUserSid?: string
 }
 
 /**
@@ -1105,6 +1136,9 @@ export function restoreWindowsAcl(
     `${holder}`,
     '--json',
   ]
+  if (opts.sandboxUserSid) {
+    args.push('--sandbox-user-sid', opts.sandboxUserSid)
+  }
   // Don't let a teardown helper throw — the caller's reset() must
   // complete. runSrtWinJson parses stdout before checking the
   // exit code, so a non-zero exit with the per-path JSON intact
@@ -1141,6 +1175,108 @@ export function restoreWindowsAcl(
 export const WINDOWS_ACL_PATH_OK = new Set<WindowsAclPathOutcome['status']>([
   'restored',
 ])
+
+export interface WindowsAclGrantOptions {
+  group: WindowsGroupRef
+  /** Paths to grant `MODIFY_NO_FDC` on (the working tree, `allowWrite`). */
+  write: readonly string[]
+  /** Paths to grant `FILE_GENERIC_READ|EXECUTE` on (`allowRead`). */
+  read: readonly string[]
+  /** SID of the dedicated sandbox user — {@link WindowsSandboxUserStatus.sid}. */
+  sandboxUserSid: string
+  /** Long-lived host PID the holds are tied to. Default: this process. */
+  holderPid?: number
+}
+
+/**
+ * Apply per-session additive `(OI)(CI)` ACEs for the sandbox user
+ * on each path. Under the separate-user model the sandbox user has
+ * no inherent rights on real-user-owned files; this is what makes
+ * the working tree (and explicit `allowRead`/`allowWrite` paths)
+ * reachable from the child. Idempotent and refcounted via srt-win's
+ * `working_aces` table.
+ *
+ * @throws on exit ≠ 0. On throw the caller should call
+ *   {@link revokeWindowsAcl} to release whatever WAS granted.
+ */
+export function grantWindowsAcl(opts: WindowsAclGrantOptions): void {
+  const holder = opts.holderPid ?? process.pid
+  const stdin = JSON.stringify({ read: opts.read, write: opts.write })
+  const r = runSrtWin(
+    [
+      'acl',
+      'grant',
+      ...groupRefArgs(opts.group),
+      '--holder-pid',
+      `${holder}`,
+      '--sandbox-user-sid',
+      opts.sandboxUserSid,
+    ],
+    stdin,
+    60_000,
+  )
+  logForDebugging(
+    `[Sandbox Windows] acl grant exit=${r.status}: ${r.stderr || r.stdout}`,
+  )
+  if (r.status !== 0) {
+    throw new Error(
+      `srt-win acl grant exited ${r.status}: ${r.stderr || r.stdout}`,
+    )
+  }
+}
+
+/** Per-path outcome from `srt-win acl revoke --json`. */
+export interface WindowsAclGrantOutcome {
+  path: string
+  status:
+    | 'revoked'
+    | 'stillHeld'
+    | 'downgraded'
+    | 'relocated'
+    | 'mismatch'
+    | 'missing'
+    | 'noRow'
+}
+
+/**
+ * Release this holder's grants and remove the sandbox-user ACE on
+ * any path whose refcount falls to zero. Best-effort (does not
+ * throw); logs anomalies.
+ */
+export function revokeWindowsAcl(opts: {
+  group: WindowsGroupRef
+  sandboxUserSid: string
+  holderPid?: number
+}): WindowsAclGrantOutcome[] | undefined {
+  const holder = opts.holderPid ?? process.pid
+  try {
+    const r = runSrtWinJson<WindowsAclGrantOutcome[]>(
+      [
+        'acl',
+        'revoke',
+        ...groupRefArgs(opts.group),
+        '--holder-pid',
+        `${holder}`,
+        '--sandbox-user-sid',
+        opts.sandboxUserSid,
+        '--json',
+      ],
+      { timeoutMs: 60_000, allowNonZero: true },
+    )
+    if (!r.ok) {
+      logForDebugging(
+        `[Sandbox Windows] acl revoke exited non-zero: ${r.stderr}`,
+        { level: 'error' },
+      )
+    }
+    return r.json
+  } catch (e) {
+    logForDebugging(`[Sandbox Windows] acl revoke: ${(e as Error).message}`, {
+      level: 'error',
+    })
+    return undefined
+  }
+}
 
 /**
  * Per-parent-directory outcomes that are expected during normal

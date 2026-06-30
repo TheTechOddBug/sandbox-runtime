@@ -127,9 +127,10 @@ pub fn read_cred() -> Result<SandboxCred> {
 pub fn trust_ca(
     der: &crate::cert_store::CertDer,
     cred: &SandboxCred,
+    sb_sid: &str,
 ) -> Result<()> {
     let code = logon::spawn_runner(
-        &cred.user, &cred.pw, None,
+        &cred.user, &cred.pw, sb_sid, None,
         &runner::RunnerCmd::InstallCa { der: der.clone() },
     )
     .context("spawn runner for CA install")?;

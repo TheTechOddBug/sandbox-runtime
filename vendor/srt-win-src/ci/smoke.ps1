@@ -425,6 +425,12 @@ try {
   $thumb = $ca.Thumbprint
   Remove-Item "Cert:\CurrentUser\My\$thumb" -ea SilentlyContinue
 
+  # `user trust-ca` is the FIRST `spawn_runner` call (CPWLW + the
+  # WinSta0/BNO grants). A hang here is the broker waiting on a
+  # runner that never finished init — e.g. an under-granted
+  # WinSta0 mask. Marker so a hung CI log shows which step it is
+  # (the captured `$out` never prints on a hang).
+  Write-Host 'ca-trust: spawning runner (CPWLW + station/BNO grants)'
   $out = & $Exe user trust-ca $caPem 2>&1 | Out-String
   if ($LASTEXITCODE -ne 0) {
     throw "user trust-ca exited ${LASTEXITCODE}: $out"

@@ -60,7 +60,8 @@ use windows::Win32::System::Threading::{
 };
 
 use crate::acl::{
-    self, AclMask, CapturedSd, MarkerHash, PrebuiltDacls, StampClass,
+    self, AclMask, CapturedSd, MarkerHash, PrebuiltDacls, SbAce,
+    StampClass,
 };
 use crate::path_id;
 use crate::util::{pcwstr, wstr};
@@ -88,7 +89,7 @@ impl std::str::FromStr for HolderPid {
 /// The cross-session same-user case is rare enough that we accept
 /// the limitation for v1; revisit if a real use case appears.
 const MUTEX_NAME: &str = r"Local\sandbox-runtime-acl-init";
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS brokers (
@@ -122,7 +123,10 @@ CREATE TABLE IF NOT EXISTS acl_snapshots (
   -- by ensure_stamped on every call — the DB column is the
   -- enumeration index for the fence-fallback query, never an
   -- assertion that the parent is on-disk-stamped.
-  parent_stamp_failed INTEGER NOT NULL DEFAULT 1
+  parent_stamp_failed INTEGER NOT NULL DEFAULT 1,
+  -- 1 for directory targets (the stamp's ALLOW ACEs carry
+  -- (OI)(CI) so the broker-only DACL inherits to the subtree).
+  is_dir         INTEGER NOT NULL DEFAULT 0
 );
 -- One row per parent directory that carries the FDC-removing
 -- allow-list. Refcounted by the number of acl_snapshots rows
@@ -136,6 +140,34 @@ CREATE TABLE IF NOT EXISTS parent_stamps (
 CREATE INDEX IF NOT EXISTS holders_by_pid ON holders (pid);
 CREATE INDEX IF NOT EXISTS snapshots_by_parent
   ON acl_snapshots (parent_path);
+-- Additive explicit ACEs for the sandbox user (separate-user
+-- model). kind ∈ {'grant','deny','deny_fdc'}: `acl grant` writes
+-- ALLOW rows, `acl stamp --sandbox-user-sid` writes DENY rows on
+-- the target plus a `deny_fdc` row on the parent. Unlike
+-- acl_snapshots this stores no original_sd — restore is
+-- `REVOKE_ACCESS` for the SID, not a full-SD restore. One row per
+-- (path, kind); a path may carry one grant AND one deny (the
+-- recompose chokepoint applies both). Refcounted via ace_holders.
+CREATE TABLE IF NOT EXISTS working_aces (
+  canonical_path TEXT NOT NULL,
+  kind           TEXT NOT NULL,
+  file_id        BLOB NOT NULL,
+  -- The effective mask currently on disk: the MAX across live
+  -- holders' want_mask (recomputed on every holder add/drop).
+  mask           TEXT NOT NULL,
+  PRIMARY KEY (canonical_path, kind)
+);
+CREATE TABLE IF NOT EXISTS ace_holders (
+  canonical_path TEXT    NOT NULL,
+  kind           TEXT    NOT NULL,
+  pid            INTEGER NOT NULL REFERENCES brokers(pid) ON DELETE CASCADE,
+  -- THIS holder's requested mask. The on-disk ACE is the MAX
+  -- across live holders; release recomputes it so a holder that
+  -- escalated the mask doesn't leave it escalated past its exit.
+  want_mask      TEXT    NOT NULL,
+  PRIMARY KEY (canonical_path, kind, pid)
+);
+CREATE INDEX IF NOT EXISTS ace_holders_by_pid ON ace_holders (pid);
 -- Install-time setup record: the sandbox user's DPAPI-encrypted
 -- credential plus the setup marker. One row per provisioned
 -- sandbox user (currently exactly one). Additive table — no
@@ -166,6 +198,7 @@ pub struct Snapshot {
     pub original_sd: Option<CapturedSd>,
     pub file_id: path_id::FileId,
     pub(crate) parent_path: Option<String>,
+    pub is_dir: bool,
 }
 
 /// One stamped parent directory (the FDC-removing allow-list).
@@ -193,6 +226,10 @@ pub struct StampWitness {
     pub needs_handle_fence: bool,
     /// File was stamped on disk but no row existed (DB wiped).
     pub original_lost: bool,
+    /// True for directory targets (the stamp's ALLOW ACEs carry
+    /// `(OI)(CI)` so the broker-only DACL inherits to the whole
+    /// subtree).
+    pub is_dir: bool,
     /// `add_holder` inserted a NEW (canon, holder_pid) row. False
     /// when this holder already held `canon` from a prior batch —
     /// rollback must NOT `release_one` such a witness or it tears
@@ -275,6 +312,8 @@ pub struct RecoveryReport {
     /// (refcount zero but `restore_sd` failed); the
     /// `parent_stamps` row is kept and the next pass retries.
     pub parents_left: u32,
+    /// Orphaned `working_aces` rows whose ACE was revoked.
+    pub aces_revoked: u32,
     /// Per-orphan detail — the structured-result output is
     /// derived from this.
     pub entries: Vec<(Snapshot, RestoreOutcome)>,
@@ -456,6 +495,11 @@ pub fn fence_plan_for_holder(
     Ok(Some(fence_plan_on(&conn, holder_pid)?))
 }
 
+/// Filter on `release_aces` for the deny-ACE lifecycle.
+pub const KIND_DENY: &[&str] = &["deny", "deny_fdc"];
+/// Filter on `release_aces` for the grant lifecycle.
+pub const KIND_GRANT: &[&str] = &["grant"];
+
 fn fence_plan_on(
     conn: &Connection,
     holder_pid: HolderPid,
@@ -596,10 +640,16 @@ pub fn open_db_at(path: &std::path::Path) -> Result<Connection> {
         );
         conn.execute_batch(
             "DROP TABLE IF EXISTS holders; \
+             DROP TABLE IF EXISTS ace_holders; \
+             DROP TABLE IF EXISTS grant_holders; \
              DROP TABLE IF EXISTS brokers; \
              DROP TABLE IF EXISTS acl_snapshots; \
              DROP TABLE IF EXISTS parent_stamps; \
+             DROP TABLE IF EXISTS working_aces; \
+             DROP TABLE IF EXISTS working_grants; \
              DROP INDEX IF EXISTS holders_by_pid; \
+             DROP INDEX IF EXISTS ace_holders_by_pid; \
+             DROP INDEX IF EXISTS grant_holders_by_pid; \
              DROP INDEX IF EXISTS snapshots_by_parent;",
         )
         .context("drop incompatible dev schema")?;
@@ -862,6 +912,7 @@ impl Locked {
         &mut self,
         canon: &str,
         want_mask: AclMask,
+        is_dir: bool,
         dacls: &PrebuiltDacls,
         refuse_escalation: bool,
     ) -> Result<StampWitness> {
@@ -877,35 +928,37 @@ impl Locked {
             .with_context(|| format!("classify SD for '{canon}'"))?;
 
         // 3. Row as original_sd hint, corroborated against the
-        //    on-disk marker.
+        //    on-disk marker. The accepted on-disk shape is `File`
+        //    for a file target and `DirTarget` for a directory; any
+        //    other marker-bearing class is shape drift (e.g. a
+        //    parent-shape DACL on a file, or a file-shape DACL on a
+        //    dir — neither is something we ever write).
         let prior = self.get_snapshot(canon)?;
         let mut original_lost = false;
+        let on_disk = match class {
+            StampClass::File(m, h) if !is_dir => Some((m, h)),
+            StampClass::DirTarget(m, h) if is_dir => Some((m, h)),
+            StampClass::Unstamped => None,
+            _ => bail!(
+                "'{canon}': on-disk DACL is a derivative of a broker \
+                 stamp (marker stripped, shape drifted, or foreign \
+                 group/user SID); refusing to capture it as \
+                 original_sd (stamped_unrecognized, fail-closed). \
+                 `acl recover --force` will write the recorded \
+                 original back if you trust the DB row."
+            ),
+        };
         let (original_sd, eff, on_disk_mask, marker): (
             Option<CapturedSd>,
             AclMask,
             Option<AclMask>,
             MarkerHash,
-        ) = match class {
-            // Any marker-bearing class on a FILE that isn't
-            // File(_, _) is shape drift (a parent-shape DACL on a
-            // file is something we never write). Same fail-closed
-            // route as StampedUnrecognized — never original_sd=cur.
-            StampClass::StampedUnrecognized
-            | StampClass::ParentAllowList(_) => {
-                bail!(
-                    "'{canon}': on-disk DACL is a derivative of a broker \
-                     stamp (marker stripped, shape drifted, or foreign \
-                     group/user SID); refusing to capture it as \
-                     original_sd (stamped_unrecognized, fail-closed). \
-                     `acl recover --force` will write the recorded \
-                     original back if you trust the DB row."
-                );
-            }
-            StampClass::Unstamped => {
+        ) = match on_disk {
+            None => {
                 let h = acl::compute_marker_hash(&cur, &cur_id);
                 (Some(cur), want_mask, None, h)
             }
-            StampClass::File(m, h) => match prior.as_ref() {
+            Some((m, h)) => match prior.as_ref() {
                 Some(p) if p.file_id == cur_id => match &p.original_sd {
                     Some(orig)
                         if acl::compute_marker_hash(orig, &p.file_id)
@@ -956,7 +1009,7 @@ impl Locked {
         //     `on_disk_mask`/`eff`. Session-level `acl stamp`
         //     keeps the existing route-to-handle-fence behaviour
         //     (step 7) instead.
-        if refuse_escalation && links != 1 {
+        if refuse_escalation && !is_dir && links != 1 {
             bail!(
                 "per-exec deny refused: '{canon}' has {links} \
                  hardlink(s); holder rows are path-keyed, so a \
@@ -987,13 +1040,14 @@ impl Locked {
             original_sd.as_ref(),
             &cur_id,
             parent.as_deref(),
+            is_dir,
         )?;
 
-        // 5. Converge the file.
+        // 5. Converge the target.
         let action = if on_disk_mask == Some(eff) {
             StampAction::AlreadyStamped
         } else {
-            acl::stamp_file_apply(canon, dacls, eff, &marker)
+            acl::stamp_target_apply(canon, dacls, eff, is_dir, &marker)
                 .with_context(|| {
                     format!("stamp '{canon}' ({eff:?}, marker)")
                 })?;
@@ -1004,12 +1058,20 @@ impl Locked {
             }
         };
 
-        // 6. Converge the parent.
-        let pstate = self.ensure_parent_stamped(parent.as_deref(), dacls)?;
+        // 6. Converge the parent (same-user model). The
+        //    separate-user model never reaches here — it goes
+        //    through `apply_aces` (DENY ACE on the file +
+        //    `(D;OICI;FDC)` on the parent) instead of the PROTECTED
+        //    rewrite.
+        let pstate =
+            self.ensure_parent_stamped(parent.as_deref(), dacls)?;
 
         // 7. Fence bit = links≠1 (alternate names may be under
-        //    unstamped parents) OR parent unstampable.
-        let multi_link = links != 1;
+        //    unstamped parents) OR parent unstampable. Directory
+        //    NumberOfLinks counts subdirs (`.` + `..`), not
+        //    hardlinks (NTFS doesn't support dir hardlinks), so
+        //    dirs never trip the multi-link route.
+        let multi_link = !is_dir && links != 1;
         if multi_link {
             eprintln!(
                 "srt-win: '{canon}' has {links} hardlink(s); routing \
@@ -1046,6 +1108,7 @@ impl Locked {
             action,
             needs_handle_fence: needs_fence,
             original_lost,
+            is_dir,
             holder_added,
             _sealed: (),
         })
@@ -1133,6 +1196,14 @@ impl Locked {
                     (None, h, true)
                 }
             },
+            // A dir-target stamp on the parent IS an FDC-removing
+            // DACL (stricter than the allow-list — the user has no
+            // FDC there at all), so a file under a stamped dir
+            // needs no separate parent_stamps row.
+            StampClass::DirTarget(_, _) => {
+                self.applied_parents.insert(parent.to_string());
+                return Ok(ParentState::Stamped);
+            }
             // Any marker-bearing class on a DIRECTORY that isn't
             // ParentAllowList(_) is shape drift (a file-shape
             // DACL on a dir is something we never write). Same
@@ -1300,24 +1371,27 @@ impl Locked {
         original_sd: Option<&CapturedSd>,
         file_id: &path_id::FileId,
         parent_path: Option<&str>,
+        is_dir: bool,
     ) -> Result<()> {
         self.conn
             .prepare_cached(
                 "INSERT INTO acl_snapshots \
                  (canonical_path, original_sd, file_id, parent_path, \
-                  parent_stamp_failed) \
-                 VALUES (?1, ?2, ?3, ?4, 1) \
+                  parent_stamp_failed, is_dir) \
+                 VALUES (?1, ?2, ?3, ?4, 1, ?5) \
                  ON CONFLICT(canonical_path) DO UPDATE SET \
                    original_sd         = excluded.original_sd, \
                    file_id             = excluded.file_id, \
                    parent_path         = excluded.parent_path, \
-                   parent_stamp_failed = 1",
+                   parent_stamp_failed = 1, \
+                   is_dir              = excluded.is_dir",
             )?
             .execute(params![
                 canon,
                 original_sd.map(CapturedSd::as_bytes),
                 file_id.as_bytes().as_slice(),
                 parent_path,
+                is_dir as i64,
             ])
             .context("UPSERT acl_snapshots")?;
         Ok(())
@@ -1384,21 +1458,21 @@ impl Locked {
     /// cannot diverge in their stamp-or-rollback semantics.
     pub fn stamp_targets(
         &mut self,
-        targets: &[(String, AclMask)],
+        targets: &[(String, AclMask, bool)],
         dacls: &PrebuiltDacls,
         refuse_escalation: bool,
     ) -> Result<(Vec<StampWitness>, usize)> {
         self.register_broker()?;
         let mut witnesses = Vec::with_capacity(targets.len());
         let mut failed = 0usize;
-        for (canon, mask) in targets {
+        for (canon, mask, is_dir) in targets {
             // No per-arm policy: every path goes through the same
             // disk-first chokepoint. The sealed StampWitness makes
             // a "trust the row, skip the disk check" branch
             // unspellable.
-            match self
-                .ensure_stamped(canon, *mask, dacls, refuse_escalation)
-            {
+            match self.ensure_stamped(
+                canon, *mask, *is_dir, dacls, refuse_escalation,
+            ) {
                 Ok(w) => witnesses.push(w),
                 Err(e) => {
                     eprintln!("srt-win: '{canon}': {e:#}");
@@ -1535,6 +1609,435 @@ impl Locked {
         self.unregister_broker()?;
         Ok(RestoreAllOutcomes { entries, parent_outs, failed })
     }
+
+    /// `register_broker` → run `f` → on `failed > 0` roll back this
+    /// batch's newly-added holder rows (via `release_one_ace`) and
+    /// drop the brokers row if the holder is now empty. Shared by
+    /// [`Self::apply_aces`] and the per-exec deny path so the two
+    /// cannot diverge in their stamp-or-rollback semantics. Only the
+    /// up-front `register_broker` propagates.
+    fn with_broker_registration(
+        &self,
+        sandbox_sid: &str,
+        f: impl FnOnce(&Self) -> Result<(Vec<AceWitness>, usize)>,
+    ) -> Result<(Vec<AceWitness>, usize)> {
+        self.register_broker()?;
+        let (witnesses, failed) = f(self)?;
+        if failed > 0 {
+            for w in witnesses.iter().filter(|w| w.holder_added) {
+                if let Err(e) =
+                    self.release_one_ace(&w.canon, w.ace.kind(), sandbox_sid)
+                {
+                    eprintln!(
+                        "srt-win: WARNING: rollback {} '{}': {e:#}; \
+                         ACE left in place",
+                        w.ace.kind(),
+                        w.canon
+                    );
+                }
+            }
+            if self
+                .my_ace_holds(None)
+                .map(|h| h.is_empty())
+                .unwrap_or(false)
+                && self.my_holds().map(|h| h.is_empty()).unwrap_or(false)
+            {
+                let _ = self.unregister_broker();
+            }
+        }
+        Ok((witnesses, failed))
+    }
+
+    /// Apply additive sandbox-user ACEs on each `(canon, ace)` and
+    /// record `self.holder_pid` as a holder. Refcounted: a path
+    /// already held by another holder gets its on-disk ACE
+    /// re-converged (idempotent) and a holder row added; release
+    /// recomputes the effective mask from the remaining holders.
+    ///
+    /// `Deny` targets implicitly add a `(parent, DenyFdc)` entry so
+    /// the sandbox user cannot `del`/`ren` the file via parent-FDC
+    /// even when the parent carries an inherited
+    /// `BUILTIN\Users:(F)`. Multiple denied siblings under one
+    /// parent share the parent's `deny_fdc` row (PK
+    /// `(path, kind, pid)` dedupes within one holder; refcount
+    /// handles cross-holder).
+    ///
+    /// All-or-nothing per batch (via [`Self::with_broker_registration`]).
+    pub fn apply_aces(
+        &self,
+        sandbox_sid: &str,
+        targets: &[(String, SbAce)],
+    ) -> Result<(Vec<AceWitness>, usize)> {
+        self.with_broker_registration(sandbox_sid, |db| {
+            let mut witnesses = Vec::with_capacity(targets.len());
+            let mut failed = 0usize;
+            let mut one = |canon: &str, ace: SbAce| {
+                match db.ensure_ace(canon, ace, sandbox_sid) {
+                    Ok(w) => witnesses.push(w),
+                    Err(e) => {
+                        eprintln!(
+                            "srt-win: {} '{canon}': {e:#}",
+                            ace.kind()
+                        );
+                        failed += 1;
+                    }
+                }
+            };
+            for (canon, ace) in targets {
+                one(canon, *ace);
+                if matches!(ace, SbAce::Deny(_))
+                    && let Some(p) = path_id::canonical_parent_of(canon)
+                {
+                    one(&p, SbAce::DenyFdc);
+                }
+            }
+            Ok((witnesses, failed))
+        })
+    }
+
+    /// Disk-first single-ACE converge. Record-first upsert (holder
+    /// row plus `working_aces` row) then [`recompose_at`] so a
+    /// crash between leaves a row whose ACE hasn't been written —
+    /// the next call re-derives and reapplies.
+    fn ensure_ace(
+        &self,
+        canon: &str,
+        want: SbAce,
+        sandbox_sid: &str,
+    ) -> Result<AceWitness> {
+        let cur_id = path_id::capture_file_id(canon)
+            .with_context(|| format!("capture file_id '{canon}'"))?;
+        let prior: Option<Vec<u8>> = self
+            .conn
+            .prepare_cached(
+                "SELECT file_id FROM working_aces \
+                 WHERE canonical_path = ?1 AND kind = ?2",
+            )?
+            .query_row(params![canon, want.kind()], |r| r.get(0))
+            .optional()
+            .context("SELECT working_aces")?;
+        if let Some(fid) = &prior
+            && path_id::FileId::from_bytes(fid)? != cur_id
+        {
+            bail!(
+                "'{canon}': file_id changed since prior {} — path \
+                 was substituted (refusing)",
+                want.kind()
+            );
+        }
+        // Holder row first (`want_mask` is THIS holder's request,
+        // independent of what other holders want — `effective_ace`
+        // computes the MAX). REPLACE so a re-apply at a different
+        // mask updates this holder's want.
+        let holder_added = self
+            .conn
+            .prepare_cached(
+                "INSERT INTO ace_holders \
+                 (canonical_path, kind, pid, want_mask) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(canonical_path, kind, pid) \
+                 DO UPDATE SET want_mask = excluded.want_mask",
+            )?
+            .execute(params![
+                canon,
+                want.kind(),
+                self.holder_pid.0 as i64,
+                want.as_str()
+            ])
+            .context("UPSERT ace_holders")?
+            > 0
+            && prior.is_none();
+        let eff = self
+            .effective_ace(canon, want.kind())?
+            .unwrap_or(want);
+        self.conn
+            .prepare_cached(
+                "INSERT INTO working_aces \
+                 (canonical_path, kind, file_id, mask) \
+                 VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(canonical_path, kind) DO UPDATE SET \
+                   file_id = excluded.file_id, \
+                   mask    = excluded.mask",
+            )?
+            .execute(params![
+                canon,
+                want.kind(),
+                cur_id.as_bytes().as_slice(),
+                eff.as_str()
+            ])
+            .context("UPSERT working_aces")?;
+        recompose_at(&self.conn, canon, sandbox_sid)?;
+        Ok(AceWitness {
+            canon: canon.to_string(),
+            ace: eff,
+            already: prior.is_some(),
+            holder_added,
+            _sealed: (),
+        })
+    }
+
+    /// `MAX(want_mask)` across live holders of `(canon, kind)`.
+    fn effective_ace(
+        &self,
+        canon: &str,
+        kind: &str,
+    ) -> Result<Option<SbAce>> {
+        let masks: Vec<String> = query_vec(
+            &self.conn,
+            "SELECT want_mask FROM ace_holders \
+             WHERE canonical_path = ?1 AND kind = ?2",
+            params![canon, kind],
+            |r| r.get(0),
+        )?;
+        masks
+            .iter()
+            .map(|m| SbAce::parse(kind, m))
+            .reduce(|a, b| Ok(a?.max(b?)))
+            .transpose()
+    }
+
+    /// Release one `(canon, kind)` hold; recompute the effective ACE
+    /// from the remaining holders (downgrade if this holder was the
+    /// one that escalated it; revoke when zero remain).
+    /// Identity-validated: if the path now resolves to a different
+    /// `file_id`, the row is dropped and the ACE on the foreign
+    /// object is NOT touched — except for `Grant`, where we
+    /// best-effort `locate_by_file_id` and revoke at the moved path
+    /// so the sandbox user does not keep stale access.
+    fn release_one_ace(
+        &self,
+        canon: &str,
+        kind: &str,
+        sandbox_sid: &str,
+    ) -> Result<AceRelease> {
+        self.conn
+            .prepare_cached(
+                "DELETE FROM ace_holders WHERE canonical_path = ?1 \
+                 AND kind = ?2 AND pid = ?3",
+            )?
+            .execute(params![canon, kind, self.holder_pid.0 as i64])
+            .context("DELETE ace_holders (self)")?;
+        let row: Option<(Vec<u8>, String)> = self
+            .conn
+            .prepare_cached(
+                "SELECT file_id, mask FROM working_aces \
+                 WHERE canonical_path = ?1 AND kind = ?2",
+            )?
+            .query_row(params![canon, kind], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .optional()?;
+        let Some((fid, stored)) = row else {
+            return Ok(AceRelease::NoRow);
+        };
+        let new_eff = self.effective_ace(canon, kind)?;
+        // Row update first (record-first), then converge disk.
+        match new_eff {
+            Some(e) => self
+                .conn
+                .execute(
+                    "UPDATE working_aces SET mask = ?3 \
+                     WHERE canonical_path = ?1 AND kind = ?2",
+                    params![canon, kind, e.as_str()],
+                )
+                .context("UPDATE working_aces (downgrade)")?,
+            None => self
+                .conn
+                .execute(
+                    "DELETE FROM working_aces \
+                     WHERE canonical_path = ?1 AND kind = ?2",
+                    params![canon, kind],
+                )
+                .context("DELETE working_aces")?,
+        };
+        let want_id = path_id::FileId::from_bytes(&fid)?;
+        match identity_gate(canon, want_id) {
+            IdGate::Match => {
+                recompose_at(&self.conn, canon, sandbox_sid)?;
+                Ok(match new_eff {
+                    Some(e) if e.as_str() == stored => {
+                        AceRelease::StillHeld
+                    }
+                    Some(_) => AceRelease::Downgraded,
+                    None => AceRelease::Revoked,
+                })
+            }
+            IdGate::Mismatch if kind == "grant" => {
+                // The granted object moved. The ALLOW ACE travels
+                // with the inode → the sandbox user still has
+                // access at the new path. Chase by file_id and
+                // revoke there (then re-converge if the new path
+                // happens to be tracked too). DENY/FDC are left in
+                // place on the moved inode (fail-closed).
+                Ok(match path_id::locate_by_file_id(&want_id) {
+                    Some(at) => {
+                        eprintln!(
+                            "srt-win: grant '{canon}': file_id moved \
+                             to '{at}'; revoking there"
+                        );
+                        recompose_at(&self.conn, &at, sandbox_sid)?;
+                        AceRelease::Relocated { moved_to: at }
+                    }
+                    None => {
+                        eprintln!(
+                            "srt-win: grant '{canon}': file_id not \
+                             found on volume; dropping row"
+                        );
+                        AceRelease::Missing
+                    }
+                })
+            }
+            IdGate::Mismatch => {
+                eprintln!(
+                    "srt-win: {kind} '{canon}': file_id mismatch — \
+                     path substituted; not touching ACE on the \
+                     foreign object (fail-closed)"
+                );
+                Ok(AceRelease::Mismatch)
+            }
+            IdGate::Unreadable => {
+                eprintln!(
+                    "srt-win: {kind} '{canon}': open failed; \
+                     dropping row"
+                );
+                Ok(AceRelease::Missing)
+            }
+        }
+    }
+
+    /// `(canon, kind)` rows held by this holder, optionally filtered
+    /// to one set of kinds.
+    fn my_ace_holds(
+        &self,
+        kinds: Option<&[&str]>,
+    ) -> Result<Vec<(String, String)>> {
+        let all: Vec<(String, String)> = query_vec(
+            &self.conn,
+            "SELECT canonical_path, kind FROM ace_holders \
+             WHERE pid = ?1",
+            params![self.holder_pid.0 as i64],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        Ok(all
+            .into_iter()
+            .filter(|(_, k)| {
+                kinds.is_none_or(|ks| ks.contains(&k.as_str()))
+            })
+            .collect())
+    }
+
+    /// Release every ACE hold of `self.holder_pid` for the given
+    /// `kinds` (`["grant"]` for `acl revoke`;
+    /// `["deny","deny_fdc"]` for `acl restore --sandbox-user-sid`)
+    /// and unregister if no holds of any kind remain. Per-path
+    /// catch-and-continue.
+    pub fn release_aces(
+        &self,
+        sandbox_sid: &str,
+        kinds: &[&str],
+    ) -> Result<(Vec<(String, AceRelease)>, usize)> {
+        let holds = self.my_ace_holds(Some(kinds))?;
+        let mut out = Vec::with_capacity(holds.len());
+        let mut failed = 0usize;
+        for (canon, kind) in &holds {
+            match self.release_one_ace(canon, kind, sandbox_sid) {
+                Ok(r) => out.push((canon.clone(), r)),
+                Err(e) => {
+                    eprintln!(
+                        "srt-win: WARNING: release {kind} '{canon}': \
+                         {e:#}; ACE left in place"
+                    );
+                    failed += 1;
+                }
+            }
+        }
+        if self.my_ace_holds(None).map(|h| h.is_empty()).unwrap_or(false)
+            && self.my_holds().map(|h| h.is_empty()).unwrap_or(false)
+        {
+            self.unregister_broker()?;
+        }
+        Ok((out, failed))
+    }
+}
+
+/// Read all `working_aces` rows for `canon` and converge the on-disk
+/// ACEs for `sandbox_sid` to exactly that set. The single chokepoint
+/// for sandbox-user ACE state — every add/drop/crash-recover routes
+/// here so a path with both a grant AND a deny (or a parent that is
+/// both granted and `deny_fdc`'d) is handled consistently.
+fn recompose_at(
+    conn: &Connection,
+    canon: &str,
+    sandbox_sid: &str,
+) -> Result<()> {
+    let rows: Vec<(String, String)> = query_vec(
+        conn,
+        "SELECT kind, mask FROM working_aces \
+         WHERE canonical_path = ?1",
+        params![canon],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let mut set = acl::SbAceSet::default();
+    for (k, m) in &rows {
+        match SbAce::parse(k, m)? {
+            SbAce::Grant(g) => set.grant = Some(g),
+            SbAce::Deny(d) => set.deny = Some(d),
+            SbAce::DenyFdc => set.deny_fdc = true,
+        }
+    }
+    acl::apply_sandbox_aces(canon, sandbox_sid, set)
+        .with_context(|| format!("recompose '{canon}' ({set:?})"))
+}
+
+/// Sealed proof that [`Locked::apply_aces`] converged `canon` to
+/// carry `ace` for the sandbox user.
+#[must_use]
+#[allow(clippy::manual_non_exhaustive)]
+#[derive(Debug)]
+pub struct AceWitness {
+    pub canon: String,
+    pub ace: SbAce,
+    /// A row already existed (another holder, or a re-apply).
+    pub already: bool,
+    pub holder_added: bool,
+    _sealed: (),
+}
+
+/// Per-path outcome of [`Locked::release_aces`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AceRelease {
+    /// ACE removed (last holder); row deleted.
+    Revoked,
+    /// Other holders remain at the SAME effective mask; ACE
+    /// untouched.
+    StillHeld,
+    /// Other holders remain at a NARROWER mask; ACE re-applied at
+    /// the new MAX(want_mask).
+    Downgraded,
+    /// `file_id` mismatch; for `grant` the ACE was revoked at the
+    /// relocated path. Row deleted.
+    Relocated { moved_to: String },
+    /// `file_id` mismatch — row deleted, ACE on the foreign object
+    /// not touched.
+    Mismatch,
+    /// Path no longer opens — row deleted.
+    Missing,
+    /// Holder row removed but no `working_aces` row found.
+    NoRow,
+}
+
+impl AceRelease {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            AceRelease::Revoked => "revoked",
+            AceRelease::StillHeld => "stillHeld",
+            AceRelease::Downgraded => "downgraded",
+            AceRelease::Relocated { .. } => "relocated",
+            AceRelease::Mismatch => "mismatch",
+            AceRelease::Missing => "missing",
+            AceRelease::NoRow => "noRow",
+        }
+    }
 }
 
 /// Per-path result of [`Locked::release_one`]. `Failed` means the
@@ -1549,7 +2052,7 @@ enum ReleaseOutcome {
 }
 
 const SNAPSHOT_SELECT_BY_PATH: &str =
-    "SELECT canonical_path, original_sd, file_id, parent_path \
+    "SELECT canonical_path, original_sd, file_id, parent_path, is_dir \
      FROM acl_snapshots WHERE canonical_path = ?1";
 
 fn snapshot_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Snapshot> {
@@ -1565,6 +2068,7 @@ fn snapshot_from_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Snapshot> {
                 )
             })?,
         parent_path: r.get(3)?,
+        is_dir: r.get::<_, i64>(4)? != 0,
     })
 }
 
@@ -1612,6 +2116,57 @@ fn crash_recovery(
     // (a broker that unregistered but crashed before restoring), so
     // always run step 3.
 
+    // 3a. Orphaned sandbox-user ACEs: any working_aces row with
+    //     zero ace_holders is one whose holder died (CASCADE
+    //     dropped the holder row above). Re-converge the path —
+    //     `recompose_at` reads the (possibly remaining) rows and
+    //     applies exactly that, so a path with one orphaned kind
+    //     and one still-held kind keeps the held one. Sandbox SID
+    //     comes from `read_setup_info` — when no sandbox user is
+    //     provisioned, there are no `working_aces` rows to orphan.
+    if let Some(sb) =
+        read_setup_info(conn)?.map(|s| s.sandbox_user_sid)
+    {
+        let orphan_aces: Vec<(String, String, Vec<u8>)> = query_vec(
+            conn,
+            "SELECT g.canonical_path, g.kind, g.file_id \
+             FROM working_aces g \
+             LEFT JOIN ace_holders h \
+               ON h.canonical_path = g.canonical_path \
+              AND h.kind = g.kind \
+             WHERE h.canonical_path IS NULL",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        for (canon, kind, fid) in orphan_aces {
+            conn.execute(
+                "DELETE FROM working_aces \
+                 WHERE canonical_path = ?1 AND kind = ?2",
+                params![&canon, &kind],
+            )
+            .context("DELETE working_aces (orphan)")?;
+            let want = path_id::FileId::from_bytes(&fid)?;
+            match identity_gate(&canon, want) {
+                IdGate::Match => {
+                    if let Err(e) = recompose_at(conn, &canon, &sb) {
+                        eprintln!(
+                            "srt-win: orphaned {kind} '{canon}': \
+                             recompose failed ({e:#})"
+                        );
+                        continue;
+                    }
+                }
+                IdGate::Mismatch if kind == "grant" => {
+                    if let Some(at) = path_id::locate_by_file_id(&want) {
+                        let _ = recompose_at(conn, &at, &sb);
+                    }
+                }
+                _ => {} // gone/substituted — nothing on disk to do
+            }
+            report.aces_revoked += 1;
+        }
+    }
+
     // 3. Any snapshot with zero holders is orphaned → restore, each
     //    path committed independently. Restore needs the
     //    calibration to classify the on-disk DACL; without it
@@ -1623,7 +2178,7 @@ fn crash_recovery(
     let orphans: Vec<Snapshot> = query_vec(
         conn,
         "SELECT s.canonical_path, s.original_sd, s.file_id, \
-                s.parent_path \
+                s.parent_path, s.is_dir \
          FROM acl_snapshots s \
          LEFT JOIN holders h ON h.canonical_path = s.canonical_path \
          WHERE h.canonical_path IS NULL",
@@ -1802,7 +2357,7 @@ fn try_restore_snapshot(
         &snap.canonical_path,
         snap.original_sd.as_ref(),
         snap.file_id,
-        RestoreKind::File,
+        if snap.is_dir { RestoreKind::Dir } else { RestoreKind::File },
         &dacls.calib,
         force,
     )?;
@@ -1844,6 +2399,7 @@ fn try_restore_snapshot(
 #[derive(Copy, Clone, PartialEq, Eq)]
 enum RestoreKind {
     File,
+    Dir,
     Parent,
 }
 
@@ -1962,13 +2518,14 @@ fn verify_and_restore(
     }
     let ours = match (kind, &class) {
         (RestoreKind::File, StampClass::File(_, h))
+        | (RestoreKind::Dir, StampClass::DirTarget(_, h))
         | (RestoreKind::Parent, StampClass::ParentAllowList(h)) => {
             Ours::Match(*h)
         }
-        (RestoreKind::File, StampClass::ParentAllowList(_))
-        | (RestoreKind::Parent, StampClass::File(_, _)) => Ours::CrossShape,
-        (_, StampClass::StampedUnrecognized) => Ours::CrossShape,
         (_, StampClass::Unstamped) => Ours::Foreign,
+        // Any other (kind, on-disk-shape) pair is shape drift —
+        // a marker-bearing DACL that this caller never writes.
+        _ => Ours::CrossShape,
     };
 
     Ok(match ours {
@@ -2404,6 +2961,7 @@ mod tests {
                 Some(&vec![1, 2, 3].into()),
                 &id,
                 Some(r"\\?\C:\d"),
+                false,
             )
             .unwrap();
             let got = db.get_snapshot(r"\\?\C:\f").unwrap().unwrap();
@@ -2414,7 +2972,7 @@ mod tests {
             assert_eq!(got.file_id, id);
             assert_eq!(got.parent_path.as_deref(), Some(r"\\?\C:\d"));
             // Upsert overwrites (record-first semantics).
-            db.upsert_snapshot(r"\\?\C:\f", None, &id, Some(r"\\?\C:\d"))
+            db.upsert_snapshot(r"\\?\C:\f", None, &id, Some(r"\\?\C:\d"), false)
                 .unwrap();
             let got = db.get_snapshot(r"\\?\C:\f").unwrap().unwrap();
             assert!(got.original_sd.is_none());

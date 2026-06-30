@@ -18,8 +18,8 @@
 //! sandbox user's while tool-resolution `PATH` is the broker's.
 //!
 //! **Do not key any ACL/WFP on the logon SID:** seclogon stamps the
-//! broker's interactive logon SID into the runner's token (so it can
-//! use the desktop). Key on the **user SID** only.
+//! broker's interactive logon SID into the runner's token. Key on
+//! the **user SID** only.
 
 use anyhow::{anyhow, Context, Result};
 use std::ffi::c_void;
@@ -43,6 +43,9 @@ use windows::Win32::System::Threading::{
 use crate::job::Job;
 use crate::launch::{quote_arg, SpawnedChild};
 use crate::util::{wstr, OwnedHandle};
+use crate::winsta::{
+    grant_sandbox_on_session_bno, grant_sandbox_on_winsta, IsolatedDesk,
+};
 
 /// One anonymous pipe pair. The end the runner gets is created
 /// inheritable; the broker's end is flipped non-inheritable so the
@@ -113,10 +116,13 @@ fn pump(src: HANDLE, dst: HANDLE) {
 
 /// Spawn `srt-win runner` as `username`, send `cmd` over stdin, and
 /// return its exit code. `cwd` is set as the runner's working
-/// directory; `None` inherits the broker's.
+/// directory; `None` inherits the broker's. `sb_sid` is the
+/// `srt-sandbox` user-SID string (for the desktop DACL and the
+/// `WinSta0` station grant).
 pub fn spawn_runner(
     username: &str,
     password: &str,
+    sb_sid: &str,
     cwd: Option<&str>,
     cmd: &crate::runner::RunnerCmd,
 ) -> Result<u32> {
@@ -124,6 +130,22 @@ pub fn spawn_runner(
     let stdin = make_pipe(false)?;
     let stdout = make_pipe(true)?;
     let stderr = make_pipe(true)?;
+
+    // Broker-side per-exec desktop on `WinSta0` with an explicit
+    // `[broker, srt-sandbox, SY]:GA` DACL. The broker (interactive
+    // user) has `WINSTA_CREATEDESKTOP` non-elevated; the runner does
+    // not — so this MUST happen here, not inside the runner. Held
+    // open until the runner exits so the kernel object survives the
+    // whole two-hop chain. See `winsta.rs` module doc.
+    let dbg = std::env::var_os("SANDBOX_RUNTIME_WIN_DEBUG").is_some();
+    let mut desk =
+        IsolatedDesk::new(Some(sb_sid)).context("broker IsolatedDesk")?;
+    if dbg {
+        eprintln!(
+            "srt-win: spawn_runner: desk={}",
+            String::from_utf16_lossy(desk.desktop_name_ptr_slice()),
+        );
+    }
 
     let exe = std::env::current_exe().context("current_exe")?;
     let exe_s = exe
@@ -159,19 +181,9 @@ pub fn spawn_runner(
     si.hStdInput = stdin.runner.raw();
     si.hStdOutput = stdout.runner.raw();
     si.hStdError = stderr.runner.raw();
-    // `lpDesktop = NULL` (zeroed). With CPWLW that means: seclogon
-    // places the runner on the broker's `WinSta0\Default` AND
-    // auto-grants the new logon access to that station+desktop. The
-    // runner's `run_lockdown` then `CreateDesktopW`s its own
-    // `WinSta0\srt-sb-…` for the CHILD (seclogon's auto-grant
-    // includes `WINSTA_CREATEDESKTOP`). We do NOT pass a broker-
-    // created desktop here: when `lpDesktop` is non-NULL the
-    // auto-grant is skipped, and the sandbox user has no rights on
-    // `WinSta0` itself, so the runner would fail to attach — same
-    // dead end as a broker-created station (admin-gated by the
-    // `\Windows\WindowStations` directory ACL). The runner is on
-    // `Default` only briefly and never touches user32; the child
-    // gets the isolated desktop.
+    // `lpDesktop = "WinSta0\srt-sb-…"`. The runner never touches
+    // `Default`; `run_lockdown` fail-closes if it somehow lands there.
+    si.lpDesktop = PWSTR(desk.desktop_name_ptr());
     let mut pi: PROCESS_INFORMATION = unsafe { zeroed() };
     // `CreateProcessWithLogonW` has no `bInheritHandles` parameter:
     // seclogon duplicates the `STARTF_USESTDHANDLES` handles into
@@ -218,11 +230,31 @@ pub fn spawn_runner(
              Secondary Logon service (seclogon) is running."
         ));
     }
+    if dbg {
+        eprintln!(
+            "srt-win: spawn_runner: CPWLW ok pid={} (suspended)",
+            pi.dwProcessId
+        );
+    }
     // Runner exists, suspended. The guard's `Drop` terminates it on
-    // any `?` until `defuse()` — so a failed assign or resume can't
-    // orphan a suspended process the (best-effort) job may not be
-    // holding.
+    // any `?` until `defuse()` — so a failed grant / assign / resume
+    // can't orphan a suspended process the (best-effort) job may not
+    // be holding.
     let mut child = SpawnedChild::new(pi);
+
+    // Grant `srt-sandbox` on the broker's `WinSta0` (with a non-NULL
+    // `lpDesktop`, seclogon skips its station auto-grant for the new
+    // logon, so the runner can't attach without this) and on the
+    // session `BaseNamedObjects` directory (so the lockdown child —
+    // whose logon SIDs are deny-only — can still create the
+    // named-object subdirectory msys2/cygwin needs). Both persist for
+    // the broker's logon session: revoking on drop would race against
+    // a concurrent `srt-win exec`. See `winsta.rs`.
+    grant_sandbox_on_winsta(sb_sid)?;
+    grant_sandbox_on_session_bno(sb_sid)?;
+    if dbg {
+        eprintln!("srt-win: spawn_runner: WinSta0 + BNO grants applied");
+    }
 
     // Assign before resuming so there is no window where broker
     // death orphans it. ERROR_NOT_SUPPORTED (seclogon's job won't
@@ -248,6 +280,9 @@ pub fn spawn_runner(
             "ResumeThread(runner): {}",
             std::io::Error::last_os_error()
         ));
+    }
+    if dbg {
+        eprintln!("srt-win: spawn_runner: runner resumed; writing spec");
     }
     child.defuse();
 
@@ -315,6 +350,7 @@ pub fn spawn_runner(
             .context("GetExitCodeProcess(runner)")?;
     }
     drop(job);
+    drop(desk);
     Ok(code)
 }
 
