@@ -1,9 +1,12 @@
 import { describe, test, expect, beforeAll, afterAll } from 'bun:test'
 import { createServer as createHttpsServer } from 'node:https'
 import type { Server, AddressInfo } from 'node:net'
+import type { TLSSocket } from 'node:tls'
 import { spawn } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import forge from 'node-forge'
 import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
 import { createMitmCA, disposeMitmCA } from '../../src/sandbox/mitm-ca.js'
 import { mintLeafCert } from '../../src/sandbox/mitm-leaf.js'
@@ -102,6 +105,38 @@ describe('tls-terminate-proxy: end-to-end through createHttpProxyServer', () => 
     expect(r.exit).toBe(0)
     expect(r.status).toBe(200)
     expect(JSON.parse(r.body).path).toBe('/ping')
+  })
+
+  test('absolute-form request-target is normalized (filterRequest + upstream)', async () => {
+    // RFC 7230 §5.3.2 absolute-form. Some clients send this inside CONNECT
+    // tunnels; without normalization the host concat produced a malformed
+    // hostname like `example.comhttps`.
+    const seen: string[] = []
+    const p = createHttpProxyServer({
+      filter: () => true,
+      filterRequest: async r => {
+        seen.push(r.url)
+        return { action: 'allow' }
+      },
+      mitmCA: ca,
+      tlsTerminateUpstreamCA: CA_PEM,
+    })
+    await new Promise<void>(r => p.listen(0, '127.0.0.1', () => r()))
+    const port = (p.address() as AddressInfo).port
+    try {
+      const r = await curlViaProxy(
+        port,
+        `https://127.0.0.1:${upstreamPort}/abs?x=1`,
+        { requestTarget: `https://127.0.0.1:${upstreamPort}/abs?x=1` },
+      )
+      expect(r.exit).toBe(0)
+      expect(r.status).toBe(200)
+      expect(JSON.parse(r.body).path).toBe('/abs?x=1')
+      expect(seen).toEqual([`https://127.0.0.1:${upstreamPort}/abs?x=1`])
+      expect(new URL(seen[0]!).hostname).toBe('127.0.0.1')
+    } finally {
+      await new Promise<void>(r => p.close(() => r()))
+    }
   })
 
   test('upstream connect failure → 502 from the terminating proxy', async () => {
@@ -206,6 +241,353 @@ describe('tls-terminate-proxy: end-to-end with ephemeral CA', () => {
   })
 })
 
+// Per-host termination opt-out (`shouldTerminateTLS`). The scenario it
+// exists for is an mTLS upstream: only the in-sandbox client holds the
+// client certificate, and it pins the real upstream CA, so the connection
+// can only work if the proxy does NOT re-originate it. The upstream here
+// requires and verifies a client cert (`rejectUnauthorized: true`) signed
+// by the fixture CA, while the proxy MITMs with a *different* (ephemeral)
+// CA — the same shape as srt's ephemeral CA vs a real upstream's PKI.
+describe('tls-terminate-proxy: per-host termination opt-out (mTLS upstream)', () => {
+  // "Real" PKI the upstream + client belong to (fixture CA).
+  const realCA = createMitmCA({ caCertPath: CA_CERT, caKeyPath: CA_KEY })
+  // The proxy's MITM CA — deliberately a different CA.
+  const proxyCA = createMitmCA({})
+
+  let upstream: Server
+  let upstreamPort: number
+  let tmpDir: string
+  let clientCertPath: string
+  let clientKeyPath: string
+
+  beforeAll(async () => {
+    const upCert = mintLeafCert(realCA, '127.0.0.1')
+    const upLeafOnly = upCert.certPem.match(
+      /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----\r?\n?/,
+    )![0]
+    upstream = createHttpsServer(
+      {
+        cert: upLeafOnly,
+        key: upCert.keyPem,
+        // True mTLS: the handshake fails unless the peer presents a cert
+        // chaining to the fixture CA.
+        requestCert: true,
+        rejectUnauthorized: true,
+        ca: CA_PEM,
+      },
+      (req, res) => {
+        // With rejectUnauthorized: true this handler only runs after the
+        // client presented a cert that verified against `ca` — reaching it
+        // at all is the mTLS proof. Echo the client CN too where the
+        // runtime supports it (Bun's server-side TLSSocket has no
+        // getPeerCertificate).
+        const tlsSocket = req.socket as TLSSocket
+        const clientCN =
+          typeof tlsSocket.getPeerCertificate === 'function'
+            ? tlsSocket.getPeerCertificate()?.subject?.CN
+            : undefined
+        res.writeHead(200, { 'content-type': 'application/json' })
+        res.end(JSON.stringify({ path: req.url, clientCN: clientCN ?? null }))
+      },
+    )
+    await new Promise<void>(r => upstream.listen(0, '127.0.0.1', r))
+    upstreamPort = (upstream.address() as AddressInfo).port
+
+    // Client cert for curl. mintLeafCert only sets EKU serverAuth, which
+    // OpenSSL rejects for client authentication, so mint one here.
+    const client = mintClientCert(realCA, 'srt-test-client')
+    tmpDir = mkdtempSync(join(tmpdir(), 'srt-mtls-test-'))
+    clientCertPath = join(tmpDir, 'client.crt')
+    clientKeyPath = join(tmpDir, 'client.key')
+    writeFileSync(clientCertPath, client.certPem)
+    writeFileSync(clientKeyPath, client.keyPem)
+  })
+
+  afterAll(async () => {
+    await new Promise<void>(r => upstream.close(() => r()))
+    await disposeMitmCA(proxyCA)
+    rmSync(tmpDir, { recursive: true, force: true })
+  })
+
+  const url = () => `https://127.0.0.1:${upstreamPort}/mtls`
+
+  test('terminating proxy cannot reach an mTLS upstream (502): it has no client cert to present', async () => {
+    const proxy = createHttpProxyServer({
+      filter: () => true,
+      mitmCA: proxyCA,
+      tlsTerminateUpstreamCA: CA_PEM,
+    })
+    await new Promise<void>(r => proxy.listen(0, '127.0.0.1', () => r()))
+    const port = (proxy.address() as AddressInfo).port
+    try {
+      // The client cooperates as much as possible: it trusts the MITM CA
+      // and offers its client cert. Still fails — the cert is presented to
+      // the proxy's listener (which never asks for it), not to the
+      // upstream, and the proxy's own outbound leg has no client cert.
+      const r = await curlViaProxy(port, url(), {
+        cacert: proxyCA.certPath,
+        clientCertPath,
+        clientKeyPath,
+      })
+      expect(r.status).toBe(502)
+    } finally {
+      await new Promise<void>(r => proxy.close(() => r()))
+    }
+  })
+
+  test('a client that pins the real upstream CA rejects the MITM leaf outright', async () => {
+    const proxy = createHttpProxyServer({
+      filter: () => true,
+      mitmCA: proxyCA,
+      tlsTerminateUpstreamCA: CA_PEM,
+    })
+    await new Promise<void>(r => proxy.listen(0, '127.0.0.1', () => r()))
+    const port = (proxy.address() as AddressInfo).port
+    try {
+      // --cacert is the REAL upstream CA, not the MITM CA: the leaf the
+      // proxy mints does not chain to it, so the handshake dies inside the
+      // CONNECT tunnel (curl 60). This is what cert-pinning clients hit.
+      const r = await curlViaProxy(port, url(), {
+        clientCertPath,
+        clientKeyPath,
+      })
+      expect(r.exit).not.toBe(0)
+      expect(r.stderr).toMatch(/certificate|issuer/i)
+    } finally {
+      await new Promise<void>(r => proxy.close(() => r()))
+    }
+  })
+
+  test('shouldTerminateTLS=false: opaque tunnel, client completes mTLS end-to-end', async () => {
+    const seen: Array<[string, number]> = []
+    const proxy = createHttpProxyServer({
+      filter: () => true,
+      mitmCA: proxyCA,
+      tlsTerminateUpstreamCA: CA_PEM,
+      shouldTerminateTLS: (hostname, port) => {
+        seen.push([hostname, port])
+        return false
+      },
+    })
+    await new Promise<void>(r => proxy.listen(0, '127.0.0.1', () => r()))
+    const port = (proxy.address() as AddressInfo).port
+    try {
+      // Same pinning client, same client cert — now it works: the tunnel is
+      // opaque, so curl handshakes with the real upstream, verifies it
+      // against the real CA, and presents its client cert to it.
+      const r = await curlViaProxy(port, url(), {
+        clientCertPath,
+        clientKeyPath,
+      })
+      expect(r.exit).toBe(0)
+      expect(r.status).toBe(200)
+      const parsed = JSON.parse(r.body)
+      expect(parsed.path).toBe('/mtls')
+      // Node reports the verified client cert's CN; Bun's server-side
+      // TLSSocket has no getPeerCertificate, so it reports null there.
+      if (parsed.clientCN !== null) {
+        expect(parsed.clientCN).toBe('srt-test-client')
+      }
+      // The cert curl saw was the upstream's real one, not a MITM leaf.
+      expect(r.stderr).toMatch(/issuer:.*srt-test-ca/)
+      expect(r.stderr).not.toMatch(/sandbox-runtime ephemeral CA/)
+      expect(seen).toContainEqual(['127.0.0.1', upstreamPort])
+    } finally {
+      await new Promise<void>(r => proxy.close(() => r()))
+    }
+  })
+
+  test('shouldTerminateTLS=false without a client cert still fails: the upstream really demands mTLS', async () => {
+    // Negative control for the test above — proves the 200 there can only
+    // come from curl's client cert being presented and verified end-to-end.
+    const proxy = createHttpProxyServer({
+      filter: () => true,
+      mitmCA: proxyCA,
+      tlsTerminateUpstreamCA: CA_PEM,
+      shouldTerminateTLS: () => false,
+    })
+    await new Promise<void>(r => proxy.listen(0, '127.0.0.1', () => r()))
+    const port = (proxy.address() as AddressInfo).port
+    try {
+      const r = await curlViaProxy(port, url())
+      // The upstream aborts the handshake inside the opaque tunnel, so curl
+      // fails at the TLS layer. (`r.status` would still read 200 here — the
+      // proxy's own "200 Connection Established" is the only header block —
+      // so the exit code is the meaningful assertion.)
+      expect(r.exit).not.toBe(0)
+      expect(r.body).toBe('')
+    } finally {
+      await new Promise<void>(r => proxy.close(() => r()))
+    }
+  })
+
+  test('shouldTerminateTLS=true keeps terminating (explicit default)', async () => {
+    const proxy = createHttpProxyServer({
+      filter: () => true,
+      mitmCA: proxyCA,
+      tlsTerminateUpstreamCA: CA_PEM,
+      shouldTerminateTLS: () => true,
+    })
+    await new Promise<void>(r => proxy.listen(0, '127.0.0.1', () => r()))
+    const port = (proxy.address() as AddressInfo).port
+    try {
+      const r = await curlViaProxy(port, url(), {
+        cacert: proxyCA.certPath,
+        clientCertPath,
+        clientKeyPath,
+      })
+      expect(r.status).toBe(502)
+    } finally {
+      await new Promise<void>(r => proxy.close(() => r()))
+    }
+  })
+})
+
+describe('tls-terminate-proxy: extraCaCertPaths lets the client verify an excluded host with a site-local root', () => {
+  // The "site-local" PKI: the fixture CA plays the role of an internal root
+  // (e.g. an internal mTLS CA) that is in no public root store. The
+  // upstream's leaf chains to it.
+  const realCA = createMitmCA({ caCertPath: CA_CERT, caKeyPath: CA_KEY })
+
+  let upstream: Server
+  let upstreamPort: number
+
+  beforeAll(async () => {
+    const upCert = mintLeafCert(realCA, '127.0.0.1')
+    const upLeafOnly = upCert.certPem.match(
+      /-----BEGIN CERTIFICATE-----[\s\S]*?-----END CERTIFICATE-----\r?\n?/,
+    )![0]
+    upstream = createHttpsServer(
+      { cert: upLeafOnly, key: upCert.keyPem },
+      (_req, res) => {
+        res.writeHead(200, { 'content-type': 'text/plain' })
+        res.end('site-local ok')
+      },
+    )
+    await new Promise<void>(r => upstream.listen(0, '127.0.0.1', r))
+    upstreamPort = (upstream.address() as AddressInfo).port
+  })
+
+  afterAll(async () => {
+    await new Promise<void>(r => upstream.close(() => r()))
+    await disposeMitmCA(realCA)
+  })
+
+  const url = () => `https://127.0.0.1:${upstreamPort}/extra-ca`
+
+  // This is the regression the field exists for: SRT points the sandboxed
+  // child's trust env vars (GIT_SSL_CAINFO, SSL_CERT_FILE, ...) at the trust
+  // bundle, REPLACING the tool's own CA config. For an excluded
+  // (passthrough) host the child does its own handshake against the real
+  // certificate, so unless the site-local root is *in the bundle* the host
+  // can never be verified from inside the sandbox.
+  test('without extraCaCertPaths the bundle cannot verify the upstream (negative control)', async () => {
+    const mitmCA = createMitmCA({})
+    const proxy = createHttpProxyServer({
+      filter: () => true,
+      mitmCA,
+      shouldTerminateTLS: () => false,
+    })
+    await new Promise<void>(r => proxy.listen(0, '127.0.0.1', () => r()))
+    const port = (proxy.address() as AddressInfo).port
+    try {
+      const r = await curlViaProxy(port, url(), {
+        cacert: mitmCA.trustBundlePath,
+      })
+      expect(r.exit).not.toBe(0)
+      expect(r.stderr).toMatch(/certificate|issuer/i)
+    } finally {
+      await new Promise<void>(r => proxy.close(() => r()))
+      await disposeMitmCA(mitmCA)
+    }
+  })
+
+  test('with extraCaCertPaths the bundle verifies the real upstream through the opaque tunnel', async () => {
+    const mitmCA = createMitmCA({ extraCaCertPaths: [CA_CERT] })
+    const proxy = createHttpProxyServer({
+      filter: () => true,
+      mitmCA,
+      shouldTerminateTLS: () => false,
+    })
+    await new Promise<void>(r => proxy.listen(0, '127.0.0.1', () => r()))
+    const port = (proxy.address() as AddressInfo).port
+    try {
+      const r = await curlViaProxy(port, url(), {
+        cacert: mitmCA.trustBundlePath,
+      })
+      expect(r.exit).toBe(0)
+      expect(r.status).toBe(200)
+      expect(r.body).toBe('site-local ok')
+      // curl saw the upstream's REAL certificate, not a MITM leaf.
+      expect(r.stderr).toMatch(/issuer:.*srt-test-ca/)
+      expect(r.stderr).not.toMatch(/sandbox-runtime ephemeral CA/)
+    } finally {
+      await new Promise<void>(r => proxy.close(() => r()))
+      await disposeMitmCA(mitmCA)
+    }
+  })
+
+  test('terminated hosts still verify against the same bundle (MITM CA is first)', async () => {
+    const mitmCA = createMitmCA({ extraCaCertPaths: [CA_CERT] })
+    const proxy = createHttpProxyServer({
+      filter: () => true,
+      mitmCA,
+      tlsTerminateUpstreamCA: CA_PEM,
+    })
+    await new Promise<void>(r => proxy.listen(0, '127.0.0.1', () => r()))
+    const port = (proxy.address() as AddressInfo).port
+    try {
+      const r = await curlViaProxy(port, url(), {
+        cacert: mitmCA.trustBundlePath,
+      })
+      expect(r.exit).toBe(0)
+      expect(r.status).toBe(200)
+      // On the terminated path curl saw the proxy-minted leaf.
+      expect(r.stderr).toMatch(/sandbox-runtime ephemeral CA/)
+    } finally {
+      await new Promise<void>(r => proxy.close(() => r()))
+      await disposeMitmCA(mitmCA)
+    }
+  })
+})
+
+/**
+ * Mint a clientAuth leaf signed by `ca` for the mTLS tests. Test-only:
+ * the production minter (mintLeafCert) is for server-side MITM leaves and
+ * intentionally only carries EKU serverAuth.
+ */
+function mintClientCert(
+  ca: ReturnType<typeof createMitmCA>,
+  cn: string,
+): { certPem: string; keyPem: string } {
+  const { pki, md, random, util } = forge
+  const keys = pki.rsa.generateKeyPair(2048)
+  const cert = pki.createCertificate()
+  cert.publicKey = keys.publicKey
+  // 16 random bytes, high bit cleared so the DER INTEGER stays positive.
+  const hex = util.bytesToHex(random.getBytesSync(16))
+  cert.serialNumber = (parseInt(hex[0]!, 16) & 0x7).toString(16) + hex.slice(1)
+  const notBefore = new Date()
+  notBefore.setDate(notBefore.getDate() - 1)
+  const notAfter = new Date()
+  notAfter.setDate(notAfter.getDate() + 30)
+  cert.validity.notBefore = notBefore
+  cert.validity.notAfter = notAfter
+  cert.setSubject([{ name: 'commonName', value: cn }])
+  cert.setIssuer(ca.cert.subject.attributes)
+  cert.setExtensions([
+    { name: 'basicConstraints', cA: false, critical: true },
+    { name: 'keyUsage', critical: true, digitalSignature: true },
+    { name: 'extKeyUsage', clientAuth: true },
+    { name: 'subjectKeyIdentifier' },
+  ])
+  cert.sign(ca.key, md.sha256.create())
+  return {
+    certPem: pki.certificateToPem(cert),
+    keyPem: pki.privateKeyToPem(keys.privateKey),
+  }
+}
+
 type CurlResult = {
   exit: number
   status: number
@@ -217,7 +599,15 @@ type CurlResult = {
 async function curlViaProxy(
   proxyPort: number,
   url: string,
-  opts: { method?: string; body?: string; cacert?: string } = {},
+  opts: {
+    method?: string
+    body?: string
+    cacert?: string
+    requestTarget?: string
+    /** Client certificate + key, for mTLS upstreams. */
+    clientCertPath?: string
+    clientKeyPath?: string
+  } = {},
 ): Promise<CurlResult> {
   const args = [
     '-sS',
@@ -234,6 +624,9 @@ async function curlViaProxy(
     opts.method ?? 'GET',
   ]
   if (opts.body !== undefined) args.push('--data-binary', opts.body)
+  if (opts.clientCertPath) args.push('--cert', opts.clientCertPath)
+  if (opts.clientKeyPath) args.push('--key', opts.clientKeyPath)
+  if (opts.requestTarget) args.push('--request-target', opts.requestTarget)
   args.push(url)
 
   // Async spawn so the in-process proxy/upstream can service the request.

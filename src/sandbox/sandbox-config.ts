@@ -186,9 +186,9 @@ const extractPatternSchema = z.string().superRefine((val, ctx) => {
  * sentinels — the rest of the file is preserved byte-for-byte. This lets a
  * tool that parses the file (`.netrc`, JSON/YAML configs) still succeed
  * inside the sandbox while the credential values are protected. If the
- * regex matches nothing, a warning is emitted to stderr and the file is
- * left readable as-is (unprotected) — fix the regex or remove the entry.
- * A future option may make this behaviour configurable.
+ * pattern matches nothing, behaviour is governed by `onExtractNoMatch`
+ * (default `"warn"` — the file is left readable as-is and a stderr
+ * warning is emitted).
  *
  * `maskDuplicates: true` (only meaningful with `extract`) additionally
  * replaces every verbatim occurrence of each captured value *outside* the
@@ -212,10 +212,36 @@ export const CredentialFileConfigSchema = z.object({
     .describe(
       'Optional regex for structured masking. Applied globally; capture ' +
         'group 1 of each match is masked, the rest of the file is preserved. ' +
-        'If the pattern matches nothing in the file, a warning is emitted ' +
-        'and the file is left readable as-is (unprotected) — fix the regex ' +
-        'or remove the entry. A future option may make this configurable. ' +
-        'Only meaningful when mode is "mask"; accepted but ignored for "deny".',
+        'If the pattern matches nothing, behaviour is governed by ' +
+        'onExtractNoMatch (default "warn"). Only meaningful when mode is ' +
+        '"mask"; accepted but ignored for "deny".',
+    ),
+  /**
+   * What to do when `extract` matches nothing in the file at runtime.
+   *
+   * - `"warn"` (default): emit a stderr warning and leave the file
+   *   readable as-is inside the sandbox (fail-open). A non-matching
+   *   pattern is treated as a config error to surface and fix, not a
+   *   reason to break a tool that needs the file when the credential is
+   *   legitimately absent.
+   * - `"deny"`: degrade the entry to `mode: "deny"` so the file is
+   *   unreadable inside the sandbox (fail-closed). The operator declared
+   *   this file as containing a credential; if the regex cannot find it,
+   *   block access rather than expose it.
+   * - `"error"`: throw at wrap time so nothing runs until the operator
+   *   fixes the regex.
+   *
+   * Only meaningful when `mode` is `"mask"` and `extract` is set;
+   * accepted but ignored otherwise.
+   */
+  onExtractNoMatch: z
+    .enum(['warn', 'deny', 'error'])
+    .optional()
+    .describe(
+      'What to do when extract matches nothing: "warn" (default — stderr ' +
+        'warning, file left readable), "deny" (degrade to mode "deny" — ' +
+        'file unreadable), or "error" (throw at wrap time). Only meaningful ' +
+        'with mode "mask" and extract set.',
     ),
   maskDuplicates: z
     .boolean()
@@ -400,6 +426,36 @@ export const NetworkConfigSchema = z.object({
         .min(1)
         .optional()
         .describe('Path to the PEM-encoded private key for caCertPath.'),
+      excludeDomains: z
+        .array(domainPatternSchema)
+        .optional()
+        .describe(
+          'Domain patterns (same syntax as allowedDomains) whose HTTPS ' +
+            'connections are NOT terminated. Matching CONNECTs are opaque ' +
+            'byte tunnels: still subject to the allow/deny domain lists, ' +
+            'but the sandboxed client completes its own TLS handshake with ' +
+            'the upstream, so filterRequest and credential injection do not ' +
+            'apply to their HTTPS traffic (plain-HTTP requests to the same ' +
+            'hosts keep the normal request pipeline). Use for hosts the ' +
+            'proxy must not re-originate: ' +
+            'mTLS upstreams (only the client holds the client certificate) ' +
+            'and clients that pin the upstream certificate and would reject ' +
+            'the MITM CA. Hosts still need to be reachable via ' +
+            'allowedDomains; this list only changes how they are tunnelled.',
+        ),
+      extraCaCertPaths: z
+        .array(z.string().min(1))
+        .optional()
+        .describe(
+          'Paths to PEM CA certificate files appended to the trust bundle ' +
+            'the sandboxed child is pointed at, after the MITM CA and the ' +
+            "host's regular roots. Use for site-local roots (e.g. an " +
+            'internal mTLS CA) presented by excluded/passthrough hosts, so ' +
+            'the child can verify them itself. Only the CERTIFICATE blocks ' +
+            'of each file are copied; files that are missing, unreadable, ' +
+            'or contain no PEM CERTIFICATE block are skipped (with a debug ' +
+            'log), so paths that exist on only some hosts are safe to list.',
+        ),
     })
     .refine(o => !o.caCertPath === !o.caKeyPath, {
       message: 'caCertPath and caKeyPath must be provided together',
@@ -422,6 +478,17 @@ export const NetworkConfigSchema = z.object({
  * Filesystem configuration schema for validation
  */
 export const FilesystemConfigSchema = z.object({
+  disabled: z
+    .boolean()
+    .optional()
+    .describe(
+      'Disable all filesystem policy enforcement. When true, no read or write rules are emitted: ' +
+        'denyRead/allowRead/allowWrite/denyWrite are ignored, and the built-in mandatory write ' +
+        'protections (.git/hooks, .git/config, shell rc files, .mcp.json, .vscode/.idea, ' +
+        '.claude/commands, .claude/agents) are NOT applied. Use only when the sandboxed process ' +
+        'is trusted with full host filesystem access. Network and credential-env restrictions ' +
+        'still apply. On Linux, /dev is still replaced by the bwrap minimal devtmpfs.',
+    ),
   denyRead: z.array(filesystemPathSchema).describe('Paths denied for reading'),
   allowRead: z
     .array(filesystemPathSchema)
@@ -477,22 +544,6 @@ export const RipgrepConfigSchema = z.object({
  * must agree with.
  */
 export const WindowsConfigSchema = z.object({
-  groupName: z
-    .string()
-    .min(1)
-    .default('sandbox-runtime-net')
-    .describe(
-      'Discriminator group name. Must match the group created at install ' +
-        'time. Ignored if groupSid is set.',
-    ),
-  groupSid: z
-    .string()
-    .regex(/^S-1-/, 'must be an S-1-… SID string')
-    .optional()
-    .describe(
-      'Discriminator group SID. Overrides groupName lookup — use for ' +
-        'domain groups or where name resolution is unreliable.',
-    ),
   wfpSublayerGuid: z
     .string()
     .uuid()
@@ -510,7 +561,7 @@ export const WindowsConfigSchema = z.object({
     .optional()
     .describe(
       'Inclusive [low, high] port range the JS http/socks proxies bind ' +
-        'inside. MUST match the range passed to `srt-win wfp install ' +
+        'inside. MUST match the range passed to `srt-win install ' +
         '--proxy-port-range` (default 60080–60089) — the WFP loopback ' +
         'permit only covers ports in that range.',
     ),
@@ -607,7 +658,7 @@ export const SandboxRuntimeConfigSchema = z
           'When set, this path is used directly instead of resolving "socat" via PATH.',
       ),
     windows: WindowsConfigSchema.optional().describe(
-      'Windows-specific settings (group, WFP sublayer, proxy port range).',
+      'Windows-specific settings (WFP sublayer, proxy port range).',
     ),
   })
   .superRefine((cfg, ctx) => {
@@ -652,6 +703,51 @@ export const SandboxRuntimeConfigSchema = z
       }
       if (entry.mode !== 'mask') return
       hasMasked = true
+      // Credential substitution only runs on the TLS-terminated path, so a
+      // host covered by tlsTerminate.excludeDomains can never receive the
+      // real value — the upstream sees the placeholder. Reject the
+      // spellings that are *entirely* self-contradictory:
+      //   - an explicit injectHosts entry whose every concrete host is
+      //     excluded (isInjectHostCoveredByAllowedDomains is the generic
+      //     "pattern fully covered by pattern list" predicate);
+      //   - no injectHosts (= every allowedDomain) while excludeDomains
+      //     covers all of allowedDomains, i.e. injection could never
+      //     happen anywhere.
+      // A *partial* overlap is legitimate (excluded hosts simply don't get
+      // the credential) and is reported at runtime instead.
+      const exclude = cfg.network.tlsTerminate?.excludeDomains
+      if (exclude?.length) {
+        if (entry.injectHosts) {
+          for (const [i, host] of entry.injectHosts.entries()) {
+            if (isInjectHostCoveredByAllowedDomains(host, exclude)) {
+              ctx.addIssue({
+                code: z.ZodIssueCode.custom,
+                path: [...path, 'injectHosts', i],
+                message:
+                  `injectHosts entry "${host}" is entirely covered by ` +
+                  `network.tlsTerminate.excludeDomains. Credential ` +
+                  `injection only runs on TLS-terminated connections, so ` +
+                  `this host would receive the placeholder instead of the ` +
+                  `credential. Remove it from one of the two lists.`,
+              })
+            }
+          }
+        } else if (
+          allowed.length > 0 &&
+          allowed.every(p => isInjectHostCoveredByAllowedDomains(p, exclude))
+        ) {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            path,
+            message:
+              `This masked credential has no injectHosts, so it defaults ` +
+              `to network.allowedDomains — but ` +
+              `network.tlsTerminate.excludeDomains covers every allowed ` +
+              `domain, so it could never be injected anywhere. Credential ` +
+              `injection only runs on TLS-terminated connections.`,
+          })
+        }
+      }
       if (entry.injectHosts !== undefined && entry.injectHosts.length === 0) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,

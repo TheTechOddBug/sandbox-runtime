@@ -47,25 +47,31 @@ export { type SandboxDependencyCheck } from './sandbox/linux-sandbox-utils.js'
 // Windows install/status API
 export {
   getSrtWinPath,
-  getWindowsGroupStatus,
   getWindowsWfpStatus,
+  verifyWindowsWfpEgress,
+  getWindowsSandboxUserStatus,
+  getWindowsSandboxCaCert,
+  windowsTrustCa,
   installWindowsSandbox,
   uninstallWindowsSandbox,
-  createWindowsGroup,
-  deleteWindowsGroup,
-  createWindowsWfp,
   windowsInstallInstructions,
-  DEFAULT_WINDOWS_GROUP_NAME,
+  stampWindowsAcl,
+  restoreWindowsAcl,
+  grantWindowsAcl,
+  revokeWindowsAcl,
+  expandWindowsFsDenyPaths,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
 } from './sandbox/windows-sandbox-utils.js'
 export type {
-  WindowsGroupRef,
   WindowsInstallOptions,
   WindowsInstallResult,
-  WindowsGroupStatus,
-  WindowsGroupStatusResult,
   WindowsWfpStatus,
+  WindowsAclStampOptions,
+  WindowsAclGrantOptions,
+  WindowsAclAceOutcome,
   WindowsWfpStatusResult,
+  WindowsWfpVerifyResult,
+  WindowsSandboxUserStatus,
 } from './sandbox/windows-sandbox-utils.js'
 export type { WindowsConfig } from './sandbox/sandbox-config.js'
 export { WindowsConfigSchema } from './sandbox/sandbox-config.js'
