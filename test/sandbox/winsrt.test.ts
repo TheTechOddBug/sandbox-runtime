@@ -28,6 +28,7 @@ import {
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
   resolveSrtWin,
+  buildGitConfigEnv,
   SRT_WIN_DISPATCH_ARG1,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
 } from '../../src/sandbox/windows-sandbox-utils.js'
@@ -341,6 +342,92 @@ describe('WindowsConfigSchema.sandboxUser (pure, all platforms)', () => {
     expect(WindowsConfigSchema.safeParse({ sandboxUser: '' }).success).toBe(
       false,
     )
+  })
+})
+
+describe('buildGitConfigEnv (pure, all platforms)', () => {
+  it('emits safe.directory (dir + dir/*) + schannel knobs; forward slashes; deduped', () => {
+    const env = buildGitConfigEnv({
+      safeDirs: ['C:\\work\\repo', 'C:/work/repo', 'C:\\other'],
+      schannelCa: true,
+    })
+    // 2 unique dirs × (exact + `<dir>/*`) + 2 schannel knobs = 6.
+    expect(env.GIT_CONFIG_COUNT).toBe('6')
+    expect(env.GIT_CONFIG_KEY_0).toBe('safe.directory')
+    expect(env.GIT_CONFIG_VALUE_0).toBe('C:/work/repo')
+    expect(env.GIT_CONFIG_VALUE_1).toBe('C:/work/repo/*')
+    expect(env.GIT_CONFIG_VALUE_2).toBe('C:/other')
+    expect(env.GIT_CONFIG_VALUE_3).toBe('C:/other/*')
+    expect(env.GIT_CONFIG_KEY_4).toBe('http.schannelUseSSLCAInfo')
+    expect(env.GIT_CONFIG_VALUE_4).toBe('true')
+    expect(env.GIT_CONFIG_KEY_5).toBe('http.schannelCheckRevoke')
+    expect(env.GIT_CONFIG_VALUE_5).toBe('false')
+  })
+
+  it('composes with an existing GIT_CONFIG_COUNT in baseEnv', () => {
+    const env = buildGitConfigEnv({
+      safeDirs: ['C:/w'],
+      schannelCa: false,
+      baseEnv: { GIT_CONFIG_COUNT: '2' },
+    })
+    // Continues numbering at 2; new total 4 (dir + dir/*). KEY_0/1
+    // are the caller's.
+    expect(env.GIT_CONFIG_KEY_2).toBe('safe.directory')
+    expect(env.GIT_CONFIG_VALUE_2).toBe('C:/w')
+    expect(env.GIT_CONFIG_VALUE_3).toBe('C:/w/*')
+    expect(env.GIT_CONFIG_COUNT).toBe('4')
+    expect(env.GIT_CONFIG_KEY_0).toBeUndefined()
+  })
+
+  it('collapses to safe.directory=* above the wildcard threshold', () => {
+    const env = buildGitConfigEnv({
+      safeDirs: Array.from({ length: 20 }, (_, i) => `C:/d${i}`),
+      schannelCa: false,
+    })
+    expect(env.GIT_CONFIG_COUNT).toBe('1')
+    expect(env.GIT_CONFIG_VALUE_0).toBe('*')
+  })
+
+  it('returns {} when nothing to emit', () => {
+    expect(buildGitConfigEnv({ safeDirs: [], schannelCa: false })).toEqual({})
+  })
+
+  it('wrapCommandWithSandboxWindows: GIT_CONFIG_* rides the --env overlay', () => {
+    const srtWin = resolveSrtWin({ path: process.execPath })
+    const { argv } = wrapCommandWithSandboxWindows({
+      command: 'git status',
+      cwd: 'C:\\work\\repo',
+      allowWrite: ['C:\\work\\other'],
+      caCertPath: 'C:/bundle.pem',
+      srtWin,
+    })
+    const envArgs = argv.filter((_, i) => argv[i - 1] === '--env')
+    // safe.directory (dir + dir/*) for cwd + each allowWrite entry,
+    // then the two schannel knobs (schannelCa keyed on caCertPath).
+    expect(envArgs).toContain('GIT_CONFIG_COUNT=6')
+    expect(envArgs).toContain('GIT_CONFIG_KEY_0=safe.directory')
+    expect(envArgs).toContain('GIT_CONFIG_VALUE_0=C:/work/repo')
+    expect(envArgs).toContain('GIT_CONFIG_VALUE_1=C:/work/repo/*')
+    expect(envArgs).toContain('GIT_CONFIG_VALUE_2=C:/work/other')
+    expect(envArgs).toContain('GIT_CONFIG_KEY_4=http.schannelUseSSLCAInfo')
+    expect(envArgs).toContain('GIT_CONFIG_KEY_5=http.schannelCheckRevoke')
+    // All --env precede `--` (clap stops parsing after it).
+    expect(argv.lastIndexOf('--env')).toBeLessThan(argv.indexOf('--'))
+  })
+
+  it('drive-root safeDir keeps its trailing slash; explicit COUNT=0 is an opt-out', () => {
+    const env = buildGitConfigEnv({ safeDirs: ['C:\\'], schannelCa: false })
+    // `C:` alone is drive-relative-cwd, not the root — git wants `C:/`.
+    expect(env.GIT_CONFIG_VALUE_0).toBe('C:/')
+    expect(env.GIT_CONFIG_VALUE_1).toBe('C://*')
+    // Explicit GIT_CONFIG_COUNT=0 in baseEnv → respect the opt-out.
+    expect(
+      buildGitConfigEnv({
+        safeDirs: ['C:/w'],
+        schannelCa: true,
+        baseEnv: { GIT_CONFIG_COUNT: '0' },
+      }),
+    ).toEqual({})
   })
 })
 
@@ -1092,7 +1179,7 @@ describe.if(isWindows)(
       // before this PR a per-exec `glob-*.secret` reached
       // `srt-win exec --deny-read` raw and `canonicalize_path`
       // hard-failed; now `wrapWithSandboxArgv` routes it through
-      // `expandWindowsFsDenyPaths` (same chokepoint as session-
+      // `expandWindowsFsPaths` (same chokepoint as session-
       // level) so the child sees two concrete `--deny-read` paths.
       const dir = mkdtempSync(join(tmpdir(), 'srt-hglob-'))
       const a = join(dir, 'glob-a.secret')

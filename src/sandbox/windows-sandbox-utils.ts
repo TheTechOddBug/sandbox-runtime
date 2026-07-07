@@ -236,7 +236,7 @@ export interface WindowsSandboxParams {
    * fails if any path cannot be stamped).
    *
    * Normalized concrete paths — globs expanded by the caller via
-   * {@link expandWindowsFsDenyPaths}, the same as session-level.
+   * {@link expandWindowsFsPaths}, the same as session-level.
    * `srt-win exec`'s `canonicalize_ace_targets` hard-fails on a
    * glob (it never expands), so a `*`/`?` reaching this field is
    * a caller bug.
@@ -244,6 +244,25 @@ export interface WindowsSandboxParams {
   denyRead?: readonly string[]
   /** Per-exec write-deny paths — see {@link denyRead}. */
   denyWrite?: readonly string[]
+  /**
+   * Working directory the child starts in. Fed to
+   * {@link buildGitConfigEnv} as a `safe.directory` entry so git
+   * inside the sandbox accepts the real-user-owned working tree.
+   * Default: `process.cwd()`.
+   *
+   * `srt-win exec` has no `--cwd` flag — the child's working
+   * directory is whatever the caller passes as the spawn `{cwd:}`
+   * option (broker `current_dir()` → runner `lpCurrentDirectory` →
+   * child inherits). This field must match that spawn option so
+   * `safe.directory` covers where git actually runs.
+   */
+  cwd?: string
+  /**
+   * Session-level write-granted paths (the resolved
+   * `filesystem.allowWrite` set). Each becomes a `safe.directory`
+   * entry — see {@link buildGitConfigEnv}.
+   */
+  allowWrite?: readonly string[]
   /**
    * Path to the TLS-termination trust bundle (the MITM CA + system
    * roots) — fed to {@link generateProxyEnvVars} so the child's
@@ -858,17 +877,17 @@ export function uninstallWindowsSandbox(
 }
 
 /**
- * Expand glob patterns in `patterns` to concrete paths via the
- * single platform-aware {@link normalizePathForSandbox} chokepoint
- * (Linux/macOS parity: point-in-time expansion at session
- * initialize, not per-exec). Non-glob paths are normalized and
+ * Resolve any Windows filesystem-config path list — `allowRead`/
+ * `allowWrite` grants and `denyRead`/`denyWrite` stamps — to
+ * concrete existing paths via the single platform-aware
+ * {@link normalizePathForSandbox} chokepoint (Linux/macOS parity:
+ * point-in-time expansion at session initialize, not per-exec).
+ * Glob patterns are expanded; non-glob paths are normalized and
  * returned 1:1. Missing paths are dropped (statSync probe).
  * Directory targets are accepted — the additive sandbox-user ACE
  * carries `(OI)(CI)` so it covers the subtree.
  */
-export function expandWindowsFsDenyPaths(
-  patterns: readonly string[],
-): string[] {
+export function expandWindowsFsPaths(patterns: readonly string[]): string[] {
   const out = new Set<string>()
   for (const raw of patterns) {
     const norm = normalizePathForSandbox(raw)
@@ -906,7 +925,7 @@ export interface WindowsAclStampOptions {
  *
  * Inputs are passed verbatim to `srt-win` (which canonicalizes and
  * rejects globs). Callers that accept globs should pre-expand via
- * {@link expandWindowsFsDenyPaths}.
+ * {@link expandWindowsFsPaths}.
  *
  * @throws on exit ≠ 0 — including exit 2 (one or more inputs
  *   skipped). srt-win stamps the resolvable inputs before exiting
@@ -1102,6 +1121,90 @@ export function revokeWindowsAcl(opts: {
 // ────────────────────────────────────────────────────────────────────
 
 /**
+ * `safe.directory` entries above this count collapse to a single
+ * `safe.directory=*`. Keeps `GIT_CONFIG_COUNT` (and the `--env`
+ * argv it rides on) bounded when `allowWrite` is wide.
+ */
+const SAFE_DIRECTORY_WILDCARD_THRESHOLD = 8
+
+/**
+ * Build the `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` /
+ * `GIT_CONFIG_VALUE_<n>` env-var set for the sandboxed child.
+ *
+ * Emits:
+ *   - `safe.directory=<dir>` for each entry in `safeDirs` (or one
+ *     `safe.directory=*` when the list is long) — the working tree
+ *     is owned by the real user, so git running as `srt-sandbox`
+ *     refuses with "detected dubious ownership" without it.
+ *   - `http.schannelUseSSLCAInfo=true` and
+ *     `http.schannelCheckRevoke=false` when `schannelCa` — makes
+ *     git's default (schannel) backend honor `GIT_SSL_CAINFO`
+ *     without `-c http.sslBackend=openssl`. Revocation is disabled
+ *     because CryptoAPI CRL/OCSP fetches ignore proxy env and would
+ *     be WFP-fenced.
+ *
+ * Composes with an existing `GIT_CONFIG_COUNT` in `baseEnv` by
+ * continuing its numbering; the returned `GIT_CONFIG_COUNT` is the
+ * new total. Under the two-hop launch the broker's own environment
+ * never reaches the child, so `baseEnv` is the caller-supplied
+ * overlay ({@link WindowsSandboxParams.setEnvVars}), not
+ * `process.env`.
+ *
+ * Paths are emitted with forward slashes so the value survives
+ * msys2's env conversion untouched and native git accepts it.
+ */
+export function buildGitConfigEnv(opts: {
+  safeDirs: readonly string[]
+  schannelCa: boolean
+  baseEnv?: Readonly<Record<string, string | undefined>>
+}): Record<string, string> {
+  // An explicit `GIT_CONFIG_COUNT=0` in baseEnv is an opt-out ("no
+  // env-level git config") — respect it rather than overwriting.
+  if (opts.baseEnv?.GIT_CONFIG_COUNT === '0') return {}
+  const parsed = Number.parseInt(opts.baseEnv?.GIT_CONFIG_COUNT ?? '', 10)
+  const start = Number.isFinite(parsed) && parsed >= 0 ? parsed : 0
+  let n = start
+  const out: Record<string, string> = {}
+  const emit = (key: string, value: string) => {
+    out[`GIT_CONFIG_KEY_${n}`] = key
+    out[`GIT_CONFIG_VALUE_${n}`] = value
+    n++
+  }
+  const dirs = [
+    ...new Set(
+      opts.safeDirs
+        .filter((d): d is string => !!d)
+        .map(d => {
+          const fwd = d.replace(/\\/g, '/')
+          const stripped = fwd.replace(/\/+$/, '')
+          // Don't strip the trailing slash off a drive root — `C:`
+          // is drive-relative-cwd, not the root; git wants `C:/`.
+          return /^[A-Za-z]:$/.test(stripped) ? `${stripped}/` : stripped
+        }),
+    ),
+  ]
+  if (dirs.length > SAFE_DIRECTORY_WILDCARD_THRESHOLD) {
+    emit('safe.directory', '*')
+  } else {
+    // git matches safe.directory against the REPO TOP-LEVEL exactly,
+    // so a workspace root doesn't cover a nested repo. Emit both the
+    // exact path and the `<dir>/*` glob (git ≥2.46) so any repo
+    // at-or-under a granted dir is trusted.
+    for (const d of dirs) {
+      emit('safe.directory', d)
+      emit('safe.directory', `${d}/*`)
+    }
+  }
+  if (opts.schannelCa) {
+    emit('http.schannelUseSSLCAInfo', 'true')
+    emit('http.schannelCheckRevoke', 'false')
+  }
+  if (n === start) return {}
+  out.GIT_CONFIG_COUNT = String(n)
+  return out
+}
+
+/**
  * Build the spawn descriptor for running `command` inside the Windows
  * sandbox: an `argv` array plus the `env` to spawn it with.
  *
@@ -1148,6 +1251,15 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // serves no purpose on Windows and breaks msys2 tools (mktemp etc.).
   delete generated.TMPDIR
 
+  // GIT_CONFIG_* set — safe.directory (dubious-ownership) + the
+  // schannel CA knobs. Composed against setEnvVars so a caller
+  // that already emits GIT_CONFIG_COUNT keeps its entries.
+  const gitCfg = buildGitConfigEnv({
+    safeDirs: [p.cwd ?? process.cwd(), ...(p.allowWrite ?? [])],
+    schannelCa: p.caCertPath !== undefined,
+    baseEnv: p.setEnvVars,
+  })
+
   const argv: string[] = [exe, ...prependArgs, 'exec']
   for (const d of p.denyRead ?? []) argv.push('--deny-read', d)
   for (const d of p.denyWrite ?? []) argv.push('--deny-write', d)
@@ -1155,15 +1267,18 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // (USERPROFILE/TEMP isolated) and overlays exactly what we pass as
   // `--env`. The broker does NOT enumerate its own env — the overlay
   // is built here from the broker's PATH, the mode:'mask' sentinel
-  // set, and the generated proxy set. Sentinels precede `generated`
-  // so a caller masking e.g. `HTTPS_PROXY` cannot break the
-  // sandbox's own proxy plumbing — same precedence as the
-  // macOS/Linux `env -u … VAR=… sandbox-exec` order.
+  // set, the generated proxy set, and the GIT_CONFIG_* set.
+  // Sentinels precede `generated` so a caller masking e.g.
+  // `HTTPS_PROXY` cannot break the sandbox's own proxy plumbing —
+  // same precedence as the macOS/Linux `env -u … VAR=…
+  // sandbox-exec` order. `gitCfg` is last so its GIT_CONFIG_COUNT
+  // (which composes against setEnvVars) wins.
   const overlay: NodeJS.ProcessEnv = {
     PATH: process.env.PATH,
     PATHEXT: process.env.PATHEXT,
     ...(p.setEnvVars ?? {}),
     ...generated,
+    ...gitCfg,
   }
   for (const [k, v] of Object.entries(overlay)) {
     if (v !== undefined) argv.push('--env', `${k}=${v}`)

@@ -47,7 +47,7 @@ import {
   checkWindowsDependencies,
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
-  expandWindowsFsDenyPaths,
+  expandWindowsFsPaths,
   stampWindowsAcl,
   restoreWindowsAcl,
   grantWindowsAcl,
@@ -953,7 +953,7 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
   if (fs?.disabled) {
     return { grantRead: [], grantWrite: [], denyRead: [], denyWrite: [] }
   }
-  const expand = expandWindowsFsDenyPaths
+  const expand = expandWindowsFsPaths
   const denyRead = expand([
     ...new Set([
       ...(fs?.denyRead ?? []),
@@ -1361,12 +1361,20 @@ async function wrapWithSandbox(
  * macOS/Linux `argv` is `[binShell, '-c', <wrapWithSandbox result>]`
  * (proxy env is baked into that command) and `env` is the unchanged
  * `process.env`, so callers can spawn uniformly across platforms.
+ *
+ * @param cwd the working directory the caller will spawn the result
+ *   with. On Windows the child's cwd is whatever the caller passes
+ *   as the spawn `{cwd:}` option (there is no `--cwd` flag), and
+ *   the `safe.directory` git-config injection derives from this — so
+ *   pass the same value here as to `spawn({cwd})`. Defaults to
+ *   `process.cwd()`. Currently unused on macOS/Linux.
  */
 async function wrapWithSandboxArgv(
   command: string,
   binShell?: string,
   customConfig?: Partial<SandboxRuntimeConfig>,
   abortSignal?: AbortSignal,
+  cwd?: string,
 ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }> {
   const platform = getPlatform()
 
@@ -1383,7 +1391,7 @@ async function wrapWithSandboxArgv(
     )
     // Per-exec FILE denies (customConfig only — the session-level
     // config's denies were already stamped at initialize()).
-    // Paths go through `expandWindowsFsDenyPaths` — the SAME
+    // Paths go through `expandWindowsFsPaths` — the SAME
     // chokepoint the session-level set uses (point-in-time glob
     // expand, normalize, missing→drop) — so a per-exec entry
     // resolves identically to its session-level equivalent.
@@ -1424,7 +1432,7 @@ async function wrapWithSandboxArgv(
       if (rawRead.length > 0 || rawWrite.length > 0) {
         const sessRead = new Set(windowsFsStampedSet?.denyRead ?? [])
         const sessWrite = new Set(windowsFsStampedSet?.denyWrite ?? [])
-        const expand = expandWindowsFsDenyPaths
+        const expand = expandWindowsFsPaths
         perExecDenyRead = expand(rawRead).filter(p => !sessRead.has(p))
         perExecDenyWrite = expand(rawWrite).filter(
           p => !sessRead.has(p) && !sessWrite.has(p),
@@ -1451,6 +1459,11 @@ async function wrapWithSandboxArgv(
       setEnvVars: credentialRestrictions.setEnvVars,
       denyRead: perExecDenyRead,
       denyWrite: perExecDenyWrite,
+      // safe.directory: cwd + the resolved session-level write
+      // grants — exactly the working-tree roots the sandbox user
+      // has MODIFY on and where git will see real-user-owned files.
+      cwd,
+      allowWrite: windowsFsStampedSet?.grantWrite,
       caCertPath: mitmCA?.trustBundlePath,
       binShell: parseWindowsBinShell(binShell),
       srtWin: customConfig?.windows?.srtWin
@@ -1890,6 +1903,7 @@ export interface ISandboxManager {
     binShell?: string,
     customConfig?: Partial<SandboxRuntimeConfig>,
     abortSignal?: AbortSignal,
+    cwd?: string,
   ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }>
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string
