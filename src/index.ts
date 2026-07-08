@@ -62,10 +62,12 @@ export {
   revokeWindowsAcl,
   expandWindowsFsPaths,
   buildGitConfigEnv,
+  parseWindowsBinShell,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
   SRT_WIN_DISPATCH_ARG1,
 } from './sandbox/windows-sandbox-utils.js'
 export type {
+  WindowsBinShell,
   WindowsInstallOptions,
   WindowsInstallResult,
   WindowsWfpStatus,

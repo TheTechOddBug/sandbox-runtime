@@ -301,30 +301,51 @@ describe('wrapCommandWithSandboxWindows (pure, all platforms)', () => {
 })
 
 describe('parseWindowsBinShell (pure, all platforms)', () => {
-  it('maps tokens/paths and rejects the rest', () => {
-    expect(parseWindowsBinShell(undefined)).toEqual({ kind: 'cmd' })
-    expect(parseWindowsBinShell('cmd')).toEqual({ kind: 'cmd' })
-    expect(parseWindowsBinShell('pwsh')).toEqual({ kind: 'pwsh' })
-    expect(parseWindowsBinShell('PowerShell')).toEqual({ kind: 'powershell' })
+  it('maps tokens/paths to {exe,args} and rejects the rest', () => {
+    // Default + bare tokens.
+    const cmd = parseWindowsBinShell(undefined)
+    expect(cmd.exe).toMatch(/System32[\\/]cmd\.exe$/)
+    expect(cmd.args).toEqual(['/d', '/s', '/c'])
+    expect(parseWindowsBinShell('cmd')).toEqual(cmd)
+    expect(parseWindowsBinShell('pwsh')).toEqual({
+      exe: 'pwsh.exe',
+      args: ['-NoProfile', '-Command'],
+    })
+    expect(parseWindowsBinShell('PowerShell').exe).toMatch(
+      /System32[\\/]WindowsPowerShell[\\/]v1\.0[\\/]powershell\.exe$/,
+    )
+    // Absolute bash/sh path → keep verbatim, `-c`.
     for (const p of [
       'C:\\Program Files\\Git\\bin\\bash.exe',
       'C:\\Program Files\\Git\\usr\\bin\\bash.exe',
       'C:\\Program Files\\Git\\bin\\sh.exe',
     ]) {
-      expect(parseWindowsBinShell(p)).toEqual({ kind: 'bash', path: p })
+      expect(parseWindowsBinShell(p)).toEqual({ exe: p, args: ['-c'] })
     }
-    // Bare/relative bash token: caller must pass the resolved absolute
-    // install path (PATH-resolved 'bash' could be WSL, not Git Bash).
+    // Absolute pwsh/powershell path → keep verbatim, PS flags.
+    // (Formerly threw — now the caller's resolved install is honoured.)
+    const pwshAbs = 'C:\\Program Files\\PowerShell\\7\\pwsh.exe'
+    expect(parseWindowsBinShell(pwshAbs)).toEqual({
+      exe: pwshAbs,
+      args: ['-NoProfile', '-Command'],
+    })
+    // Object form: passthrough with absolute-exe validation only.
+    const obj = { exe: pwshAbs, args: ['-NoProfile', '-EncodedCommand'] }
+    expect(parseWindowsBinShell(obj)).toBe(obj)
+    expect(() =>
+      parseWindowsBinShell({ exe: 'pwsh.exe', args: ['-Command'] }),
+    ).toThrow(/binShell\.exe must be an absolute path/)
+    // Bare bash: caller must pass the resolved absolute install path
+    // (PATH-resolved 'bash' could be WSL, not Git Bash).
     expect(() => parseWindowsBinShell('bash')).toThrow(/absolute/)
+    // Relative-with-directory: never silently degrade.
+    expect(() => parseWindowsBinShell('bin\\bash.exe')).toThrow(
+      /bare token or an absolute path/,
+    )
     // Unknown values fail loud rather than silently routing to cmd.exe.
     expect(() => parseWindowsBinShell('zsh')).toThrow(/unrecognised binShell/)
     expect(() =>
       parseWindowsBinShell('C:\\Program Files\\Git\\git-bash.exe'),
-    ).toThrow(/unrecognised binShell/)
-    // An absolute path to pwsh/cmd is NOT a token — reject rather than
-    // silently dropping the caller's path and degrading to PATH lookup.
-    expect(() =>
-      parseWindowsBinShell('C:\\Program Files\\PowerShell\\7\\pwsh.exe'),
     ).toThrow(/unrecognised binShell/)
   })
 })
@@ -438,12 +459,12 @@ describe.if(isWindows)('Windows sandbox: srt-win helpers', () => {
     expect(p).toMatch(/srt-win\.exe$/i)
   })
 
-  it('wrapCommandWithSandboxWindows: binShell={kind:bash} → [path, -c, cmd] (not cmd.exe)', () => {
+  it('wrapCommandWithSandboxWindows: binShell={exe,args} → [exe, ...args, cmd] (not cmd.exe)', () => {
     const cmd = `echo 'a b' && printf '%s' x | cat`
     const bashPath = 'C:\\Program Files\\Git\\bin\\bash.exe'
     const { argv } = wrapCommandWithSandboxWindows({
       command: cmd,
-      binShell: { kind: 'bash', path: bashPath },
+      binShell: parseWindowsBinShell(bashPath),
     })
     expect(argv.slice(-3)).toEqual([bashPath, '-c', cmd])
     expect(argv).not.toContain('/c')
