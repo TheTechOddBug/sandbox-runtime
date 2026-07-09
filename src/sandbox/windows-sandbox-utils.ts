@@ -29,8 +29,8 @@ import type { SrtWinConfig } from './sandbox-config.js'
  * provides an `exec` subcommand that spawns the target via a two-hop
  * launch (broker → `CreateProcessWithLogonW(runner)` → runner →
  * restricted-token child) under `srt-sandbox`. The sandboxed child
- * reaches the host only via the JS http/socks proxies, which the
- * caller passes in via `--env`.
+ * reaches the host only via the JS mux proxy, which the caller
+ * passes in via `--env`.
  *
  * The separate-user account structurally closes the surrogate-spawn
  * class (schtasks, `PROC_THREAD_ATTRIBUTE_PARENT_PROCESS`, BITS,
@@ -201,9 +201,17 @@ export function parseWindowsBinShell(raw?: string): WindowsBinShell {
 
 export interface WindowsSandboxParams {
   command: string
-  /** JS HTTP proxy port — fed to `generateProxyEnvVars` for the env overlay. */
+  /**
+   * JS HTTP proxy port — fed to `generateProxyEnvVars` for the env
+   * overlay. With the in-process proxy this is the mux front-end
+   * port (same as `socksProxyPort`).
+   */
   httpProxyPort?: number
-  /** JS SOCKS proxy port — fed to `generateProxyEnvVars` for the env overlay. */
+  /**
+   * JS SOCKS proxy port — fed to `generateProxyEnvVars` for the env
+   * overlay. With the in-process proxy this is the mux front-end
+   * port (same as `httpProxyPort`).
+   */
   socksProxyPort?: number
   /** Per-session proxy auth token; embedded in proxy env URLs. */
   proxyAuthToken?: string
@@ -228,7 +236,7 @@ export interface WindowsSandboxParams {
    * fails if any path cannot be stamped).
    *
    * Normalized concrete paths — globs expanded by the caller via
-   * {@link expandWindowsFsDenyPaths}, the same as session-level.
+   * {@link expandWindowsFsPaths}, the same as session-level.
    * `srt-win exec`'s `canonicalize_ace_targets` hard-fails on a
    * glob (it never expands), so a `*`/`?` reaching this field is
    * a caller bug.
@@ -237,19 +245,43 @@ export interface WindowsSandboxParams {
   /** Per-exec write-deny paths — see {@link denyRead}. */
   denyWrite?: readonly string[]
   /**
-   * PEM-encoded CA certificate file. Same parameter macOS/Linux
-   * thread to {@link generateProxyEnvVars} for the env-var trust
-   * layer (`NODE_EXTRA_CA_CERTS` etc.). NOT passed to `srt-win
-   * exec` — schannel-level trust under the sandbox user is set
-   * separately via `srt-win user trust-ca` /
-   * {@link windowsTrustCa}; per-exec only sets the env-var layer.
+   * Working directory the child starts in. Fed to
+   * {@link buildGitConfigEnv} as a `safe.directory` entry so git
+   * inside the sandbox accepts the real-user-owned working tree.
+   * Default: `process.cwd()`.
    *
-   * Currently NOT forwarded to the child: the bundle file lives in
-   * the broker's `%TEMP%`, which the `srt-sandbox` user cannot
-   * read, so OpenSSL clients (msys2 curl, openssl-backed git, node,
-   * python) would fail with `ACCESS_DENIED` on the bundle. The
-   * schannel-level trust set via {@link windowsTrustCa} is the only
-   * CA-trust path until working-tree/profile grants land.
+   * `srt-win exec` has no `--cwd` flag — the child's working
+   * directory is whatever the caller passes as the spawn `{cwd:}`
+   * option (broker `current_dir()` → runner `lpCurrentDirectory` →
+   * child inherits). This field must match that spawn option so
+   * `safe.directory` covers where git actually runs.
+   */
+  cwd?: string
+  /**
+   * Session-level write-granted paths (the resolved
+   * `filesystem.allowWrite` set). Each becomes a `safe.directory`
+   * entry — see {@link buildGitConfigEnv}.
+   */
+  allowWrite?: readonly string[]
+  /**
+   * Path to the TLS-termination trust bundle (the MITM CA + system
+   * roots) — fed to {@link generateProxyEnvVars} so the child's
+   * `NODE_EXTRA_CA_CERTS` / `CURL_CA_BUNDLE` / `SSL_CERT_FILE` /
+   * etc. point at it. Backslashes are normalised to forward slashes
+   * before emission so the value survives msys2 env conversion AND
+   * is accepted by native tools.
+   *
+   * The env-var layer covers OpenSSL-backed clients (msys2 curl,
+   * openssl-backed git, node, python, cargo). Schannel/.NET clients
+   * that read the Windows certificate store exclusively (System32
+   * `curl.exe`, `Invoke-WebRequest`, Go-built tools) trust via the
+   * separate `srt-win user trust-ca` / {@link windowsTrustCa}
+   * install-time write into the sandbox user's `CurrentUser\Root`.
+   *
+   * The caller is responsible for the sandbox user having read
+   * access to this path — `sandbox-manager.ts`'s `initialize()`
+   * pushes it into the session's `acl grant` read-set alongside the
+   * working-tree grants.
    */
   caCertPath?: string
   /**
@@ -709,10 +741,16 @@ export interface WindowsInstallOptions {
    */
   proxyPortRange?: readonly [number, number]
   /**
+   * Name for the sandbox user account (created if absent, adopted
+   * if it already exists as a local user). Default `srt-sandbox`.
+   */
+  sandboxUser?: string
+  /**
    * Replace an existing install whose configuration differs
-   * (different port range under the same sublayer). Without this,
-   * install refuses with "already installed with different config"
-   * rather than silently overwriting.
+   * (different port range or sandbox-user name under the same
+   * sublayer). Without this, install refuses with "already
+   * installed with different config" rather than silently
+   * overwriting.
    */
   force?: boolean
   /** Resolved `srt-win` spawn descriptor — from {@link resolveSrtWin}. */
@@ -763,6 +801,7 @@ export function installWindowsSandbox(
       `${opts.proxyPortRange[0]}-${opts.proxyPortRange[1]}`,
     )
   }
+  if (opts.sandboxUser) args.push('--sandbox-user', opts.sandboxUser)
   if (opts.force) args.push('--force')
 
   const r = runSrtWin(args, { timeoutMs: 60_000, srtWin })
@@ -796,8 +835,9 @@ export function installWindowsSandbox(
     case 13:
       throw new Error(
         `srt-win install: filters already exist under this sublayer with ` +
-          `a different port range. Pass {force: true} to replace, or ` +
-          `pick a different sublayerGuid. Output: ${out}`,
+          `a different port range or sandbox-user name. Pass ` +
+          `{force: true} to replace, or pick a different sublayerGuid. ` +
+          `Output: ${out}`,
       )
     default:
       throw new Error(`srt-win install failed (exit ${r.status}): ${out}`)
@@ -837,17 +877,17 @@ export function uninstallWindowsSandbox(
 }
 
 /**
- * Expand glob patterns in `patterns` to concrete paths via the
- * single platform-aware {@link normalizePathForSandbox} chokepoint
- * (Linux/macOS parity: point-in-time expansion at session
- * initialize, not per-exec). Non-glob paths are normalized and
+ * Resolve any Windows filesystem-config path list — `allowRead`/
+ * `allowWrite` grants and `denyRead`/`denyWrite` stamps — to
+ * concrete existing paths via the single platform-aware
+ * {@link normalizePathForSandbox} chokepoint (Linux/macOS parity:
+ * point-in-time expansion at session initialize, not per-exec).
+ * Glob patterns are expanded; non-glob paths are normalized and
  * returned 1:1. Missing paths are dropped (statSync probe).
  * Directory targets are accepted — the additive sandbox-user ACE
  * carries `(OI)(CI)` so it covers the subtree.
  */
-export function expandWindowsFsDenyPaths(
-  patterns: readonly string[],
-): string[] {
+export function expandWindowsFsPaths(patterns: readonly string[]): string[] {
   const out = new Set<string>()
   for (const raw of patterns) {
     const norm = normalizePathForSandbox(raw)
@@ -885,7 +925,7 @@ export interface WindowsAclStampOptions {
  *
  * Inputs are passed verbatim to `srt-win` (which canonicalizes and
  * rejects globs). Callers that accept globs should pre-expand via
- * {@link expandWindowsFsDenyPaths}.
+ * {@link expandWindowsFsPaths}.
  *
  * @throws on exit ≠ 0 — including exit 2 (one or more inputs
  *   skipped). srt-win stamps the resolvable inputs before exiting
@@ -1081,6 +1121,90 @@ export function revokeWindowsAcl(opts: {
 // ────────────────────────────────────────────────────────────────────
 
 /**
+ * `safe.directory` entries above this count collapse to a single
+ * `safe.directory=*`. Keeps `GIT_CONFIG_COUNT` (and the `--env`
+ * argv it rides on) bounded when `allowWrite` is wide.
+ */
+const SAFE_DIRECTORY_WILDCARD_THRESHOLD = 8
+
+/**
+ * Build the `GIT_CONFIG_COUNT` / `GIT_CONFIG_KEY_<n>` /
+ * `GIT_CONFIG_VALUE_<n>` env-var set for the sandboxed child.
+ *
+ * Emits:
+ *   - `safe.directory=<dir>` for each entry in `safeDirs` (or one
+ *     `safe.directory=*` when the list is long) — the working tree
+ *     is owned by the real user, so git running as `srt-sandbox`
+ *     refuses with "detected dubious ownership" without it.
+ *   - `http.schannelUseSSLCAInfo=true` and
+ *     `http.schannelCheckRevoke=false` when `schannelCa` — makes
+ *     git's default (schannel) backend honor `GIT_SSL_CAINFO`
+ *     without `-c http.sslBackend=openssl`. Revocation is disabled
+ *     because CryptoAPI CRL/OCSP fetches ignore proxy env and would
+ *     be WFP-fenced.
+ *
+ * Composes with an existing `GIT_CONFIG_COUNT` in `baseEnv` by
+ * continuing its numbering; the returned `GIT_CONFIG_COUNT` is the
+ * new total. Under the two-hop launch the broker's own environment
+ * never reaches the child, so `baseEnv` is the caller-supplied
+ * overlay ({@link WindowsSandboxParams.setEnvVars}), not
+ * `process.env`.
+ *
+ * Paths are emitted with forward slashes so the value survives
+ * msys2's env conversion untouched and native git accepts it.
+ */
+export function buildGitConfigEnv(opts: {
+  safeDirs: readonly string[]
+  schannelCa: boolean
+  baseEnv?: Readonly<Record<string, string | undefined>>
+}): Record<string, string> {
+  // An explicit `GIT_CONFIG_COUNT=0` in baseEnv is an opt-out ("no
+  // env-level git config") — respect it rather than overwriting.
+  if (opts.baseEnv?.GIT_CONFIG_COUNT === '0') return {}
+  const parsed = Number.parseInt(opts.baseEnv?.GIT_CONFIG_COUNT ?? '', 10)
+  const start = Number.isFinite(parsed) && parsed >= 0 ? parsed : 0
+  let n = start
+  const out: Record<string, string> = {}
+  const emit = (key: string, value: string) => {
+    out[`GIT_CONFIG_KEY_${n}`] = key
+    out[`GIT_CONFIG_VALUE_${n}`] = value
+    n++
+  }
+  const dirs = [
+    ...new Set(
+      opts.safeDirs
+        .filter((d): d is string => !!d)
+        .map(d => {
+          const fwd = d.replace(/\\/g, '/')
+          const stripped = fwd.replace(/\/+$/, '')
+          // Don't strip the trailing slash off a drive root — `C:`
+          // is drive-relative-cwd, not the root; git wants `C:/`.
+          return /^[A-Za-z]:$/.test(stripped) ? `${stripped}/` : stripped
+        }),
+    ),
+  ]
+  if (dirs.length > SAFE_DIRECTORY_WILDCARD_THRESHOLD) {
+    emit('safe.directory', '*')
+  } else {
+    // git matches safe.directory against the REPO TOP-LEVEL exactly,
+    // so a workspace root doesn't cover a nested repo. Emit both the
+    // exact path and the `<dir>/*` glob (git ≥2.46) so any repo
+    // at-or-under a granted dir is trusted.
+    for (const d of dirs) {
+      emit('safe.directory', d)
+      emit('safe.directory', `${d}/*`)
+    }
+  }
+  if (opts.schannelCa) {
+    emit('http.schannelUseSSLCAInfo', 'true')
+    emit('http.schannelCheckRevoke', 'false')
+  }
+  if (n === start) return {}
+  out.GIT_CONFIG_COUNT = String(n)
+  return out
+}
+
+/**
  * Build the spawn descriptor for running `command` inside the Windows
  * sandbox: an `argv` array plus the `env` to spawn it with.
  *
@@ -1107,26 +1231,19 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // same object feeds (a) the spawn env merge below and (b) the
   // explicit `--env` overlay for the runner.
   //
-  // The CA-bundle path is OMITTED: it points into the broker's
-  // `%TEMP%\srt-sandbox-…`, which the `srt-sandbox` user cannot
-  // read — OpenSSL-backed clients (msys2 curl, openssl-backed git,
-  // node, python) would fail to open it (curl exit 77 etc.).
-  // Schannel-level trust comes from the registry write `srt-win user
-  // trust-ca` did at install time; the env-var bundle layer lands
-  // with the working-tree/profile-grant work.
-  if (p.caCertPath !== undefined) {
-    logForDebugging(
-      `[Sandbox Windows] caCertPath '${p.caCertPath}' not forwarded ` +
-        `(broker %TEMP% is unreadable by srt-sandbox); schannel ` +
-        `trust via 'srt-win user trust-ca' is the only CA-trust ` +
-        `path for the two-hop launch`,
-    )
-  }
+  // The CA trust-bundle path is emitted with forward slashes:
+  // msys2's POSIX-path conversion leaves `C:/…` alone and every
+  // tool we set the var for (curl, git, node, python, …) accepts
+  // forward slashes on Windows; backslashes would be mangled if
+  // the value passes through a bash command line. Schannel-level
+  // trust comes from the registry write `srt-win user trust-ca`
+  // did at install time; the env-var layer here covers the
+  // OpenSSL-backed tools.
   const generated = envListToObject(
     generateProxyEnvVars(
       p.httpProxyPort,
       p.socksProxyPort,
-      undefined, // caCertPath — see above
+      p.caCertPath?.replace(/\\/g, '/'),
       p.proxyAuthToken,
     ),
   )
@@ -1134,27 +1251,34 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   // serves no purpose on Windows and breaks msys2 tools (mktemp etc.).
   delete generated.TMPDIR
 
+  // GIT_CONFIG_* set — safe.directory (dubious-ownership) + the
+  // schannel CA knobs. Composed against setEnvVars so a caller
+  // that already emits GIT_CONFIG_COUNT keeps its entries.
+  const gitCfg = buildGitConfigEnv({
+    safeDirs: [p.cwd ?? process.cwd(), ...(p.allowWrite ?? [])],
+    schannelCa: p.caCertPath !== undefined,
+    baseEnv: p.setEnvVars,
+  })
+
   const argv: string[] = [exe, ...prependArgs, 'exec']
-  // Required while srt-win still has LaunchMode::SameUser as
-  // default; dropped in the Rust same-user-removal PR. `--env`
-  // on main carries `requires = "as_sandbox_user"`, so this
-  // must precede the overlay below.
-  argv.push('--as-sandbox-user')
   for (const d of p.denyRead ?? []) argv.push('--deny-read', d)
   for (const d of p.denyWrite ?? []) argv.push('--deny-write', d)
   // The two-hop runner starts with the SANDBOX user's profile env
   // (USERPROFILE/TEMP isolated) and overlays exactly what we pass as
   // `--env`. The broker does NOT enumerate its own env — the overlay
   // is built here from the broker's PATH, the mode:'mask' sentinel
-  // set, and the generated proxy set. Sentinels precede `generated`
-  // so a caller masking e.g. `HTTPS_PROXY` cannot break the
-  // sandbox's own proxy plumbing — same precedence as the
-  // macOS/Linux `env -u … VAR=… sandbox-exec` order.
+  // set, the generated proxy set, and the GIT_CONFIG_* set.
+  // Sentinels precede `generated` so a caller masking e.g.
+  // `HTTPS_PROXY` cannot break the sandbox's own proxy plumbing —
+  // same precedence as the macOS/Linux `env -u … VAR=…
+  // sandbox-exec` order. `gitCfg` is last so its GIT_CONFIG_COUNT
+  // (which composes against setEnvVars) wins.
   const overlay: NodeJS.ProcessEnv = {
     PATH: process.env.PATH,
     PATHEXT: process.env.PATHEXT,
     ...(p.setEnvVars ?? {}),
     ...generated,
+    ...gitCfg,
   }
   for (const [k, v] of Object.entries(overlay)) {
     if (v !== undefined) argv.push('--env', `${k}=${v}`)

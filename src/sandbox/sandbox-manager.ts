@@ -9,7 +9,12 @@ import {
   buildMaskedFileBinds,
 } from './credential-mask-files.js'
 import { buildMaskedEnvVars } from './credential-mask-env.js'
-import { createMitmCA, disposeMitmCA, type MitmCA } from './mitm-ca.js'
+import {
+  createMitmCA,
+  CRL_PATH,
+  disposeMitmCA,
+  type MitmCA,
+} from './mitm-ca.js'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
@@ -40,10 +45,14 @@ import {
   startMacOSSandboxLogMonitor,
 } from './macos-sandbox-utils.js'
 import {
+  startLinuxSandboxViolationMonitor,
+  type LinuxViolationMonitor,
+} from './linux-violation-monitor.js'
+import {
   checkWindowsDependencies,
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
-  expandWindowsFsDenyPaths,
+  expandWindowsFsPaths,
   stampWindowsAcl,
   restoreWindowsAcl,
   grantWindowsAcl,
@@ -73,6 +82,7 @@ import { matchesDomainPattern } from './domain-pattern.js'
 import type { ChildProcess } from 'node:child_process'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import { EOL } from 'node:os'
+import { dirname } from 'node:path'
 
 interface HostNetworkManagerContext {
   httpProxyPort: number
@@ -92,6 +102,7 @@ let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
 let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
+let linuxMonitor: LinuxViolationMonitor | undefined
 let parentProxy: ResolvedParentProxy | undefined
 let mitmCA: MitmCA | undefined
 // Per-session proxy auth token. Generated at proxy start, exported only into
@@ -418,6 +429,26 @@ async function initialize(
     )
     logForDebugging('Started macOS sandbox log monitor')
   }
+  if (enableLogMonitor && getPlatform() === 'linux') {
+    linuxMonitor = startLinuxSandboxViolationMonitor(
+      sandboxViolationStore.addViolation.bind(sandboxViolationStore),
+      {
+        // apply-seccomp's observer reports every write-intent syscall
+        // (allowed or not). Only paths bwrap would actually refuse — outside
+        // allowWrite or inside a denyWrite carve-out — go to the store.
+        allowWritePaths: [
+          ...getDefaultWritePaths(),
+          ...config.filesystem.allowWrite,
+        ],
+        denyWritePaths: config.filesystem.denyWrite,
+        ignoreViolations: config.ignoreViolations,
+      },
+    )
+    // Don't block initialization on listen() — wrap-time checks
+    // fs.existsSync(observeSocketPath) and degrades gracefully.
+    void linuxMonitor.ready
+    logForDebugging('Started Linux seccomp violation monitor')
+  }
 
   // Register cleanup handlers first time
   registerCleanup()
@@ -495,6 +526,19 @@ async function initialize(
     // Filesystem grants/denies — additive sandbox-user ACEs.
     try {
       const acc = computeWindowsFsAccessSet(runtimeConfig)
+      // The trust bundle the CA-trust env vars point at
+      // (NODE_EXTRA_CA_CERTS etc.) must be readable by the
+      // srt-sandbox child. It's written into the broker's %TEMP%,
+      // which the sandbox user has no inherent rights on, so it
+      // rides the same session-level `acl grant` read-set as the
+      // working tree. Granted on the mkdtemp DIR (not the file)
+      // so the (OI)(CI) ACE covers both the file open AND the
+      // parent-directory list that cmd's `type`/`FindFirstFile`
+      // does before opening. Mirrors the mac/linux
+      // `expandedAllowRead` push in wrapWithSandbox.
+      if (mitmCA) {
+        acc.grantRead.push(dirname(mitmCA.trustBundlePath))
+      }
       // `u` was fetched once above for the provisioning gate; the
       // same status carries the SID — don't re-spawn `srt-win user
       // status` here.
@@ -595,6 +639,18 @@ async function initialize(
         : undefined
       const httpProxyPort = config.network.httpProxyPort ?? muxPort!
       const socksProxyPort = config.network.socksProxyPort ?? muxPort!
+      // Leaves are minted lazily per-CONNECT (after this point), so setting
+      // the CDP URL now means every leaf carries it. See MitmCA.crlUrl.
+      // Windows-only: on Linux the child runs under bwrap --unshare-net and
+      // reaches the proxy via a socat bridge on a fixed netns port, so a
+      // host-namespace mux port would be unreachable — worse than no CDP,
+      // since a Schannel-analog client (Java, OpenSSL with CRL_CHECK) then
+      // hard-fails "CRL fetch error" instead of soft-passing "no CDP". macOS
+      // has no in-tree Schannel-analog client. Also gated on `muxPort`: an
+      // external `network.httpProxyPort` doesn't answer /srt.crl.
+      if (mitmCA && muxPort !== undefined && getPlatform() === 'windows') {
+        mitmCA.crlUrl = `http://127.0.0.1:${muxPort}${CRL_PATH}`
+      }
       if (config.network.httpProxyPort !== undefined) {
         logForDebugging(`Using external HTTP proxy on port ${httpProxyPort}`)
       }
@@ -919,7 +975,7 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
   if (fs?.disabled) {
     return { grantRead: [], grantWrite: [], denyRead: [], denyWrite: [] }
   }
-  const expand = expandWindowsFsDenyPaths
+  const expand = expandWindowsFsPaths
   const denyRead = expand([
     ...new Set([
       ...(fs?.denyRead ?? []),
@@ -1292,6 +1348,7 @@ async function wrapWithSandbox(
         seccompConfig: getSeccompConfig(),
         bwrapPath: config?.bwrapPath,
         socatPath: config?.socatPath,
+        observeSocketPath: linuxMonitor?.observeSocketPath,
         abortSignal,
       })
 
@@ -1327,12 +1384,20 @@ async function wrapWithSandbox(
  * macOS/Linux `argv` is `[binShell, '-c', <wrapWithSandbox result>]`
  * (proxy env is baked into that command) and `env` is the unchanged
  * `process.env`, so callers can spawn uniformly across platforms.
+ *
+ * @param cwd the working directory the caller will spawn the result
+ *   with. On Windows the child's cwd is whatever the caller passes
+ *   as the spawn `{cwd:}` option (there is no `--cwd` flag), and
+ *   the `safe.directory` git-config injection derives from this — so
+ *   pass the same value here as to `spawn({cwd})`. Defaults to
+ *   `process.cwd()`. Currently unused on macOS/Linux.
  */
 async function wrapWithSandboxArgv(
   command: string,
   binShell?: string,
   customConfig?: Partial<SandboxRuntimeConfig>,
   abortSignal?: AbortSignal,
+  cwd?: string,
 ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }> {
   const platform = getPlatform()
 
@@ -1349,7 +1414,7 @@ async function wrapWithSandboxArgv(
     )
     // Per-exec FILE denies (customConfig only — the session-level
     // config's denies were already stamped at initialize()).
-    // Paths go through `expandWindowsFsDenyPaths` — the SAME
+    // Paths go through `expandWindowsFsPaths` — the SAME
     // chokepoint the session-level set uses (point-in-time glob
     // expand, normalize, missing→drop) — so a per-exec entry
     // resolves identically to its session-level equivalent.
@@ -1390,7 +1455,7 @@ async function wrapWithSandboxArgv(
       if (rawRead.length > 0 || rawWrite.length > 0) {
         const sessRead = new Set(windowsFsStampedSet?.denyRead ?? [])
         const sessWrite = new Set(windowsFsStampedSet?.denyWrite ?? [])
-        const expand = expandWindowsFsDenyPaths
+        const expand = expandWindowsFsPaths
         perExecDenyRead = expand(rawRead).filter(p => !sessRead.has(p))
         perExecDenyWrite = expand(rawWrite).filter(
           p => !sessRead.has(p) && !sessWrite.has(p),
@@ -1417,6 +1482,11 @@ async function wrapWithSandboxArgv(
       setEnvVars: credentialRestrictions.setEnvVars,
       denyRead: perExecDenyRead,
       denyWrite: perExecDenyWrite,
+      // safe.directory: cwd + the resolved session-level write
+      // grants — exactly the working-tree roots the sandbox user
+      // has MODIFY on and where git will see real-user-owned files.
+      cwd,
+      allowWrite: windowsFsStampedSet?.grantWrite,
       caCertPath: mitmCA?.trustBundlePath,
       binShell: parseWindowsBinShell(binShell),
       srtWin: customConfig?.windows?.srtWin
@@ -1449,7 +1519,7 @@ function getConfig(): SandboxRuntimeConfig | undefined {
  * Update the sandbox configuration in place.
  *
  * **Network/allowlist changes are a live swap**: the running
- * http/socks proxies read `config.network.allowedDomains` /
+ * mux proxy reads `config.network.allowedDomains` /
  * `deniedDomains` per-request (via `filterNetworkRequest`), so
  * reassigning `config` here takes effect on the next connection
  * with no proxy rebind and no port change — on every platform,
@@ -1664,6 +1734,10 @@ async function reset(): Promise<void> {
     logMonitorShutdown()
     logMonitorShutdown = undefined
   }
+  if (linuxMonitor) {
+    linuxMonitor.stop()
+    linuxMonitor = undefined
+  }
 
   if (managerContext?.linuxBridge) {
     const {
@@ -1856,6 +1930,7 @@ export interface ISandboxManager {
     binShell?: string,
     customConfig?: Partial<SandboxRuntimeConfig>,
     abortSignal?: AbortSignal,
+    cwd?: string,
   ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }>
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string

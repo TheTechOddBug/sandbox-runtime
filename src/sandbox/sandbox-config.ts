@@ -625,6 +625,19 @@ export const SrtWinConfigSchema = z.object({
  * `.extend()`/`.shape` it.
  */
 export const WindowsConfigSchema = z.object({
+  sandboxUser: z
+    .string()
+    .min(1)
+    .max(20, 'Windows local usernames are limited to 20 characters')
+    .optional()
+    .describe(
+      'Name for the dedicated sandbox user account that `srt-win install` ' +
+        'creates and the sandboxed child runs as. Default: `srt-sandbox`. ' +
+        'Install refuses if an account by this name already exists and ' +
+        'srt-win did not create it (it will not rotate the password of an ' +
+        'account it does not own). Must match what `srt-win install ' +
+        '--sandbox-user` was run with.',
+    ),
   sublayerGuid: z
     .string()
     .uuid()
@@ -646,7 +659,7 @@ export const WindowsConfigSchema = z.object({
     })
     .optional()
     .describe(
-      'Inclusive [low, high] port range the JS http/socks proxies bind ' +
+      'Inclusive [low, high] port range the JS mux proxy listeners bind ' +
         'inside. MUST match the range passed to `srt-win install ' +
         '--proxy-port-range` (default 60080–60089) — the WFP loopback ' +
         'permit only covers ports in that range.',
