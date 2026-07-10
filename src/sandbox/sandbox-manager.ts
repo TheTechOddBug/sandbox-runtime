@@ -62,6 +62,7 @@ import {
   verifyWindowsWfpEgress,
   resolveSrtWin,
   type SrtWinSpawn,
+  type WindowsBinShell,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
 } from './windows-sandbox-utils.js'
 import {
@@ -1394,7 +1395,7 @@ async function wrapWithSandbox(
  */
 async function wrapWithSandboxArgv(
   command: string,
-  binShell?: string,
+  binShell?: string | WindowsBinShell,
   customConfig?: Partial<SandboxRuntimeConfig>,
   abortSignal?: AbortSignal,
   cwd?: string,
@@ -1497,6 +1498,12 @@ async function wrapWithSandboxArgv(
 
   // macOS/Linux: delegate to the existing string wrapper, then put
   // the result behind `<shell> -c` so the caller's argv-spawn works.
+  if (typeof binShell === 'object') {
+    throw new Error(
+      'binShell object form is Windows-only; pass a shell path string ' +
+        'on macOS/Linux',
+    )
+  }
   const wrapped = await wrapWithSandbox(
     command,
     binShell,
@@ -1927,7 +1934,7 @@ export interface ISandboxManager {
   ): Promise<string>
   wrapWithSandboxArgv(
     command: string,
-    binShell?: string,
+    binShell?: string | WindowsBinShell,
     customConfig?: Partial<SandboxRuntimeConfig>,
     abortSignal?: AbortSignal,
     cwd?: string,

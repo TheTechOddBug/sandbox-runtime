@@ -131,70 +131,117 @@ export interface WindowsSandboxUserStatus {
 }
 
 /**
- * Inner shell to run `command` under, inside the sandbox. The
- * discriminant picks both the executable and the flag shape (`/c`
- * vs `-Command` vs `-c`); see {@link wrapCommandWithSandboxWindows}.
- *
- * For `kind: 'bash'`, `path` is the absolute Git Bash executable
- * (no fixed install location). It MUST originate from trusted host
+ * Inner shell to run `command` under, inside the sandbox: the
+ * executable to spawn and the flag argv placed between it and the
+ * user's command string. `exe` MUST originate from trusted host
  * configuration (user settings / install detection), NEVER from
  * workspace or repository content — the inner shell runs INSIDE the
  * sandbox so an unexpected path is not a sandbox-escape vector, but
  * it would still be an arbitrary-exec footgun if sourced from
  * untrusted input.
+ *
+ * Construct via {@link parseWindowsBinShell} — it is the SOLE
+ * normalizer and the only place validation lives.
  */
-export type WindowsBinShell =
-  | { kind: 'cmd' }
-  | { kind: 'powershell' }
-  | { kind: 'pwsh' }
-  | { kind: 'bash'; path: string }
+export type WindowsBinShell = {
+  /** Shell executable to spawn (absolute path when caller-supplied). */
+  exe: string
+  /** Argv placed between `exe` and the user's command string. */
+  args: readonly string[]
+}
+
+const PWSH_FLAGS = ['-NoProfile', '-Command'] as const
 
 /**
- * Adapter from the cross-platform `binShell?: string` surface
- * ({@link SandboxManager.wrapWithSandboxArgv}) to the Windows
- * discriminated union. Throws on any value outside the recognised
- * set — there is no silent fallback to cmd.exe.
+ * Sole normalizer from the cross-platform `binShell?: string |
+ * WindowsBinShell` surface ({@link SandboxManager.wrapWithSandboxArgv})
+ * to a spawnable `{exe, args}` pair. All validation lives here —
+ * {@link wrapCommandWithSandboxWindows} consumes the result verbatim.
+ *
+ * String form: bare token (`'cmd'|'pwsh'|'powershell'`) resolves to
+ * the default install; absolute path to `bash.exe`/`sh.exe`/
+ * `pwsh.exe`/`powershell.exe`/`cmd.exe` keeps the caller's path with
+ * the matching flag shape. Object form: `exe` must be absolute; `args`
+ * pass through unchanged. Throws on anything else — no silent
+ * fallback to cmd.exe.
  *
  * Uses `path.win32` explicitly so the function (and its unit test)
  * is platform-independent.
  */
-export function parseWindowsBinShell(raw?: string): WindowsBinShell {
-  if (raw === undefined) return { kind: 'cmd' }
-  // bash/sh: path semantics — match on basename, keep the caller's
-  // absolute path verbatim.
-  const base = path.win32.basename(raw).toLowerCase()
-  if (
-    base === 'bash' ||
-    base === 'bash.exe' ||
-    base === 'sh' ||
-    base === 'sh.exe'
-  ) {
-    if (!path.win32.isAbsolute(raw)) {
+export function parseWindowsBinShell(
+  raw?: string | WindowsBinShell,
+): WindowsBinShell {
+  const systemRoot = process.env.SystemRoot ?? 'C:\\Windows'
+  const cmdDefault: WindowsBinShell = {
+    exe: path.win32.join(systemRoot, 'System32', 'cmd.exe'),
+    args: ['/d', '/s', '/c'],
+  }
+  if (raw === undefined || raw === null) return cmdDefault
+  if (typeof raw === 'object') {
+    if (!path.win32.isAbsolute(raw.exe)) {
       throw new Error(
-        `binShell bash path must be absolute (got ${JSON.stringify(raw)}); ` +
-          `pass the resolved Git Bash install path`,
+        `binShell.exe must be an absolute path ` +
+          `(got ${JSON.stringify(raw.exe)})`,
       )
     }
-    return { kind: 'bash', path: raw }
+    if (!Array.isArray(raw.args)) {
+      throw new Error(
+        `binShell.args must be an array (got ${JSON.stringify(raw.args)})`,
+      )
+    }
+    return raw
   }
-  // cmd/powershell/pwsh: token semantics — match on the FULL string,
-  // not basename, so an absolute path to pwsh.exe (whose path we'd
-  // otherwise discard) falls through to the explicit throw rather
-  // than silently degrading to a PATH lookup.
-  switch (raw.toLowerCase()) {
+  const rawBase = path.win32.basename(raw)
+  const base = rawBase.toLowerCase()
+  const isAbs = path.win32.isAbsolute(raw)
+  // A relative path with a directory component (`bin\bash.exe`) is
+  // neither a token nor a resolved install — never silently degrade.
+  if (!isAbs && raw !== rawBase) {
+    throw new Error(
+      `binShell string must be a bare token or an absolute path ` +
+        `(got ${JSON.stringify(raw)})`,
+    )
+  }
+  switch (base) {
+    case 'bash':
+    case 'bash.exe':
+    case 'sh':
+    case 'sh.exe':
+      // Bare 'bash' is ambiguous (WSL vs Git Bash) — require the
+      // resolved install path.
+      if (!isAbs) {
+        throw new Error(
+          `binShell bash path must be absolute ` +
+            `(got ${JSON.stringify(raw)}); pass the resolved Git Bash ` +
+            `install path`,
+        )
+      }
+      return { exe: raw, args: ['-c'] }
     case 'pwsh':
     case 'pwsh.exe':
-      return { kind: 'pwsh' }
+      return { exe: isAbs ? raw : 'pwsh.exe', args: PWSH_FLAGS }
     case 'powershell':
     case 'powershell.exe':
-      return { kind: 'powershell' }
+      return {
+        exe: isAbs
+          ? raw
+          : path.win32.join(
+              systemRoot,
+              'System32',
+              'WindowsPowerShell',
+              'v1.0',
+              'powershell.exe',
+            ),
+        args: PWSH_FLAGS,
+      }
     case 'cmd':
     case 'cmd.exe':
-      return { kind: 'cmd' }
+      return isAbs ? { exe: raw, args: cmdDefault.args } : cmdDefault
     default:
       throw new Error(
         `unrecognised binShell ${JSON.stringify(raw)}: expected ` +
-          `'cmd' | 'powershell' | 'pwsh' or an absolute path to bash.exe/sh.exe`,
+          `'cmd' | 'powershell' | 'pwsh' or an absolute path to ` +
+          `bash.exe/sh.exe/pwsh.exe/powershell.exe`,
       )
   }
 }
@@ -298,13 +345,13 @@ export interface WindowsSandboxParams {
    */
   srtWin?: SrtWinSpawn
   /**
-   * Inner shell. Defaults to `{ kind: 'cmd' }`. The child's post-`/c`
-   * (or `-Command` / `-c`) content is **passthrough** — `&` chains,
-   * `"…"`/`'…'` quotes exactly as written. The security boundary is at
-   * the OUTER spawn (this argv is spawned with `shell:false`); the
-   * inner shell runs INSIDE the sandbox so its metachars are the
-   * user's tool. See {@link parseWindowsBinShell} for the
-   * cross-platform string adapter.
+   * Inner shell. Defaults to `parseWindowsBinShell(undefined)`
+   * (System32 cmd.exe). The child's post-`args` content is
+   * **passthrough** — `&` chains, `"…"`/`'…'` quotes exactly as
+   * written. The security boundary is at the OUTER spawn (this argv
+   * is spawned with `shell:false`); the inner shell runs INSIDE the
+   * sandbox so its metachars are the user's tool. Construct via
+   * {@link parseWindowsBinShell}.
    */
   binShell?: WindowsBinShell
 }
@@ -1305,48 +1352,12 @@ export function wrapCommandWithSandboxWindows(p: WindowsSandboxParams): {
   }
   argv.push('--')
 
-  const systemRoot = process.env.SystemRoot ?? 'C:\\Windows'
-  const sh = p.binShell ?? { kind: 'cmd' }
-  switch (sh.kind) {
-    case 'bash':
-      // Git Bash: invoke the caller-supplied path directly with
-      // `-c <command>`. `command` is a fully-assembled bash command
-      // string with its own internal quoting; srt-win's `build_cmdline`
-      // takes the generic non-cmd branch and MSVCRT-quotes it as a
-      // SINGLE argv element, so bash receives it intact as argv[2].
-      argv.push(sh.path, '-c', p.command)
-      break
-    case 'pwsh':
-      argv.push('pwsh.exe', '-NoProfile', '-Command', p.command)
-      break
-    case 'powershell':
-      argv.push(
-        path.join(
-          systemRoot,
-          'System32',
-          'WindowsPowerShell',
-          'v1.0',
-          'powershell.exe',
-        ),
-        '-NoProfile',
-        '-Command',
-        p.command,
-      )
-      break
-    case 'cmd':
-      // cmd /d (no AutoRun) /s (strip first+last quote of post-/c by
-      // position) /c (run-then-exit). The `command` string lands as a
-      // single argv element; srt-win's build_cmdline wraps it in one
-      // outer "…" pair for /s to consume. See launch.rs.
-      argv.push(
-        path.join(systemRoot, 'System32', 'cmd.exe'),
-        '/d',
-        '/s',
-        '/c',
-        p.command,
-      )
-      break
-  }
+  // Inner shell: `{exe, args}` from parseWindowsBinShell — the SOLE
+  // normalizer. `p.command` lands as a single argv element; srt-win's
+  // `build_cmdline` MSVCRT-quotes it (or wraps in one outer "…" for
+  // cmd /s) so the inner shell receives it intact. See launch.rs.
+  const sh = p.binShell ?? parseWindowsBinShell(undefined)
+  argv.push(sh.exe, ...sh.args, p.command)
 
   // CreateProcessW's lpCommandLine is capped at 32 767 WCHARs.
   // Node's `shell:false` spawn builds it by MSVCRT-quoting each
