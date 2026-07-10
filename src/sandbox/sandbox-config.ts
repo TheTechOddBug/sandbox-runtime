@@ -362,6 +362,21 @@ export const CredentialFileConfigSchema = z.object({
  * the credential's injectHosts. A masked var that is unset on the host is
  * skipped — there is nothing to protect.
  *
+ * `mode: "mask"` without `extract` is **whole-value** masking: the entire
+ * value is replaced inside the sandbox with one sentinel string, and the
+ * proxy substitutes that sentinel back to the real value on egress. This
+ * works for variables whose value *is* the credential (a bare token).
+ *
+ * `mode: "mask"` with `extract` is **structured** masking: the regex is
+ * applied globally to the real value, capture group 1 of each match is a
+ * credential value, and only those captured spans are replaced with
+ * sentinels — the rest of the value is preserved byte-for-byte. This lets
+ * a tool that parses the value (a `DATABASE_URL` connection string, a
+ * composite `KEY:SECRET` pair) still succeed inside the sandbox while the
+ * credential spans are protected. If the pattern matches nothing,
+ * behaviour is governed by `onExtractNoMatch` (default `"warn"` — the
+ * variable passes through unmasked and a stderr warning is emitted).
+ *
  * `mode: "mask"` with `decode: "jwt"` handles a variable whose whole value
  * is a JWT (CI OIDC tokens, Supabase keys, ...). `decode` opens the encoded
  * value for masking: without claim-level configuration the entire token is
@@ -384,14 +399,49 @@ export const CredentialFileConfigSchema = z.object({
  * If the variable is set but its value does not verify as a JWT — or, with
  * `maskClaims`, no named claim is present as a string — nothing was masked:
  * the entry currently fails open — the real value stays in the sandbox
- * environment and a loud stderr warning names the variable. This policy
- * routing will unify with `onExtractNoMatch` when env-var extraction lands.
+ * environment and a loud stderr warning names the variable.
  */
 export const CredentialEnvVarConfigSchema = z.object({
   name: envVarNameSchema.describe('Environment variable name'),
   mode: credentialModeSchema.describe(
     'Access mode for this environment variable',
   ),
+  extract: extractPatternSchema
+    .optional()
+    .describe(
+      'Optional regex for structured masking. Applied globally; capture ' +
+        'group 1 of each match is masked, the rest of the value is ' +
+        'preserved. If the pattern matches nothing, behaviour is governed ' +
+        'by onExtractNoMatch (default "warn"). Only meaningful when mode ' +
+        'is "mask"; accepted but ignored for "deny".',
+    ),
+  /**
+   * What to do when `extract` matches nothing in the value at runtime.
+   *
+   * - `"warn"` (default): emit a stderr warning and let the variable pass
+   *   through unmasked inside the sandbox (fail-open). A non-matching
+   *   pattern is treated as a config error to surface and fix, not a
+   *   reason to break a tool that needs the variable when the credential
+   *   is legitimately absent from it.
+   * - `"deny"`: unset the variable inside the sandbox (fail-closed) — the
+   *   env analog of degrading a file to `mode: "deny"`. The operator
+   *   declared this variable as containing a credential; if the regex
+   *   cannot find it, withhold the value rather than expose it.
+   * - `"error"`: throw at wrap time so nothing runs until the operator
+   *   fixes the regex.
+   *
+   * Only meaningful when `mode` is `"mask"` and `extract` is set;
+   * accepted but ignored otherwise.
+   */
+  onExtractNoMatch: z
+    .enum(['warn', 'deny', 'error'])
+    .optional()
+    .describe(
+      'What to do when extract matches nothing: "warn" (default — stderr ' +
+        'warning, variable passes through unmasked), "deny" (variable ' +
+        'unset inside the sandbox), or "error" (throw at wrap time). Only ' +
+        'meaningful with mode "mask" and extract set.',
+    ),
   decode: z
     .enum(['jwt'])
     .optional()
@@ -699,12 +749,55 @@ export const RipgrepConfigSchema = z.object({
 })
 
 /**
+ * Configuration for locating/invoking the `srt-win` helper (Windows
+ * only). An embedder that links `srt-win`'s CLI into its own
+ * multicall binary points `path` at that binary; spawns then pass
+ * `--srt-win` as `argv[1]` (see `SRT_WIN_DISPATCH_ARG1` in
+ * `windows-sandbox-utils.ts` / `srt_win::SRT_WIN_DISPATCH_ARG1`) so
+ * the embedder's dispatcher can route to `srt_win::run_from_args`.
+ * Windows cannot reliably preserve a spoofed `argv[0]` across
+ * `CreateProcessWithLogonW` / `ShellExecuteExW(runas)`, so dispatch
+ * keys on `argv[1]`, not on `argv[0]` like
+ * {@link SeccompConfigSchema} does on Linux.
+ */
+export const SrtWinConfigSchema = z.object({
+  path: z
+    .string()
+    .min(1)
+    .optional()
+    .describe(
+      'Path to the srt-win binary. When unset, getSrtWinPath() resolves ' +
+        'the packaged vendor/srt-win/<arch>/srt-win.exe. When set, the ' +
+        'binary is spawned with the `--srt-win` argv[1] sentinel so a ' +
+        "multicall dispatcher can route to srt-win's CLI.",
+    ),
+})
+
+/**
  * Windows-specific configuration schema. See
  * `windows-sandbox-utils.ts` for the install flow these settings
  * must agree with.
+ *
+ * Canonical: `sublayerGuid`; the `wfpSublayerGuid` alias is resolved
+ * at read sites (`sublayerGuid ?? wfpSublayerGuid`) rather than via
+ * `.transform()` so this stays a plain `ZodObject` for consumers that
+ * `.extend()`/`.shape` it.
  */
 export const WindowsConfigSchema = z.object({
-  wfpSublayerGuid: z
+  sandboxUser: z
+    .string()
+    .min(1)
+    .max(20, 'Windows local usernames are limited to 20 characters')
+    .optional()
+    .describe(
+      'Name for the dedicated sandbox user account that `srt-win install` ' +
+        'creates and the sandboxed child runs as. Default: `srt-sandbox`. ' +
+        'Install refuses if an account by this name already exists and ' +
+        'srt-win did not create it (it will not rotate the password of an ' +
+        'account it does not own). Must match what `srt-win install ' +
+        '--sandbox-user` was run with.',
+    ),
+  sublayerGuid: z
     .string()
     .uuid()
     .optional()
@@ -713,6 +806,11 @@ export const WindowsConfigSchema = z.object({
         'use the srt-win compile-time default. Set this when filters were ' +
         'installed by enterprise tooling under a custom sublayer.',
     ),
+  wfpSublayerGuid: z
+    .string()
+    .uuid()
+    .optional()
+    .describe('Deprecated alias for sublayerGuid.'),
   proxyPortRange: z
     .tuple([z.number().int().min(1), z.number().int().max(65535)])
     .refine(([lo, hi]) => lo <= hi && hi - lo <= 64, {
@@ -720,11 +818,16 @@ export const WindowsConfigSchema = z.object({
     })
     .optional()
     .describe(
-      'Inclusive [low, high] port range the JS http/socks proxies bind ' +
+      'Inclusive [low, high] port range the JS mux proxy listeners bind ' +
         'inside. MUST match the range passed to `srt-win install ' +
         '--proxy-port-range` (default 60080–60089) — the WFP loopback ' +
         'permit only covers ports in that range.',
     ),
+  srtWin: SrtWinConfigSchema.optional().describe(
+    'How to locate/invoke the srt-win helper binary. Omit to resolve the ' +
+      'packaged vendor binary; set when embedding srt-win into a multicall ' +
+      'binary.',
+  ),
 })
 
 /**
@@ -1025,5 +1128,6 @@ export type IgnoreViolationsConfig = z.infer<
 >
 export type RipgrepConfig = z.infer<typeof RipgrepConfigSchema>
 export type SeccompConfig = z.infer<typeof SeccompConfigSchema>
+export type SrtWinConfig = z.infer<typeof SrtWinConfigSchema>
 export type WindowsConfig = z.infer<typeof WindowsConfigSchema>
 export type SandboxRuntimeConfig = z.infer<typeof SandboxRuntimeConfigSchema>

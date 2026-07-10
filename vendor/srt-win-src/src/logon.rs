@@ -1,5 +1,5 @@
 //! Broker-side `CreateProcessWithLogonW` wrapper for the
-//! `--as-sandbox-user` two-hop launch.
+//! broker→runner two-hop launch.
 //!
 //! Spawns `srt-win.exe runner` under the `srt-sandbox` account
 //! (via the Secondary Logon service — no
@@ -105,13 +105,16 @@ fn pump(src: HANDLE, dst: HANDLE) {
 /// return its exit code. `cwd` is set as the runner's working
 /// directory; `None` inherits the broker's. `sb_sid` is the
 /// `srt-sandbox` user-SID string (for the desktop DACL and the
-/// `WinSta0` station grant).
+/// `WinSta0` station grant). `quiet` suppresses the informational
+/// stderr lines (the seclogon-job note); `SANDBOX_RUNTIME_WIN_DEBUG`
+/// checkpoints are gated separately on `dbg` and are unaffected.
 pub fn spawn_runner(
     username: &str,
     password: &str,
     sb_sid: &str,
     cwd: Option<&str>,
     cmd: &crate::runner::RunnerCmd,
+    quiet: bool,
 ) -> Result<u32> {
     let cmd_bytes = crate::runner::encode_cmd(cmd)?;
     let stdin = make_pipe(false)?;
@@ -125,13 +128,7 @@ pub fn spawn_runner(
     // open until the runner exits so the kernel object survives the
     // whole two-hop chain. See `winsta.rs` module doc.
     let dbg = std::env::var_os("SANDBOX_RUNTIME_WIN_DEBUG").is_some();
-    let mut desk = IsolatedDesk::new(Some(sb_sid)).context("broker IsolatedDesk")?;
-    if dbg {
-        eprintln!(
-            "srt-win: spawn_runner: desk={}",
-            String::from_utf16_lossy(desk.desktop_name_ptr_slice()),
-        );
-    }
+    let mut desk = IsolatedDesk::new(sb_sid).context("broker IsolatedDesk")?;
 
     let exe = std::env::current_exe().context("current_exe")?;
     let exe_s = exe
@@ -139,9 +136,17 @@ pub fn spawn_runner(
         .ok_or_else(|| anyhow!("current_exe is not UTF-8"))?;
     let exe_w = wstr(exe_s);
     // `lpCommandLine` is parsed via `CommandLineToArgvW`; quote
-    // argv[0] so a path with spaces survives. `runner` is the only
-    // argument.
-    let mut cmdline_w = wstr(&format!("{} runner", quote_arg(exe_s)));
+    // argv[0] so a path with spaces survives. The
+    // `SRT_WIN_DISPATCH_ARG1` sentinel at argv[1] is what a
+    // multicall embedder's dispatcher routes on (`argv[0]` cannot be
+    // spoofed across CPWLW); `run_from_args` strips it before clap so
+    // the standalone binary accepts it harmlessly. `runner` is the
+    // only real argument.
+    let mut cmdline_w = wstr(&format!(
+        "{} {} runner",
+        quote_arg(exe_s),
+        crate::cli::SRT_WIN_DISPATCH_ARG1,
+    ));
     let user_w = wstr(username);
     let domain_w = wstr(".");
     let mut pw_w = wstr(password);
@@ -254,11 +259,13 @@ pub fn spawn_runner(
             .map(|we| we.code() == ERROR_NOT_SUPPORTED.to_hresult())
             .unwrap_or(false)
         {
-            eprintln!(
-                "srt-win: broker→runner Job assign not supported \
-                 (seclogon job); relying on runner→child Job for \
-                 kill-chain"
-            );
+            if !quiet {
+                eprintln!(
+                    "srt-win: broker→runner Job assign not supported \
+                     (seclogon job); relying on runner→child Job for \
+                     kill-chain"
+                );
+            }
         } else {
             return Err(e.context("assign runner to job"));
         }
@@ -333,7 +340,6 @@ pub fn spawn_runner(
         GetExitCodeProcess(child.process(), &mut code).context("GetExitCodeProcess(runner)")?;
     }
     drop(job);
-    drop(desk);
     Ok(code)
 }
 

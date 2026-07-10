@@ -8,13 +8,18 @@ import {
   MaskedFileStore,
   buildMaskedFileBinds,
 } from './credential-mask-files.js'
-import { maskJwtClaims, mintFakeJwt, verifyJwt } from './credential-decode.js'
-import { createMitmCA, disposeMitmCA, type MitmCA } from './mitm-ca.js'
+import { buildMaskedEnvVars } from './credential-mask-env.js'
+import {
+  createMitmCA,
+  CRL_PATH,
+  disposeMitmCA,
+  type MitmCA,
+} from './mitm-ca.js'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
-import { randomBytes, randomUUID, X509Certificate } from 'node:crypto'
+import { randomBytes, X509Certificate } from 'node:crypto'
 import type {
   CredentialsConfig,
   SandboxRuntimeConfig,
@@ -40,10 +45,14 @@ import {
   startMacOSSandboxLogMonitor,
 } from './macos-sandbox-utils.js'
 import {
+  startLinuxSandboxViolationMonitor,
+  type LinuxViolationMonitor,
+} from './linux-violation-monitor.js'
+import {
   checkWindowsDependencies,
   wrapCommandWithSandboxWindows,
   parseWindowsBinShell,
-  expandWindowsFsDenyPaths,
+  expandWindowsFsPaths,
   stampWindowsAcl,
   restoreWindowsAcl,
   grantWindowsAcl,
@@ -51,6 +60,9 @@ import {
   getWindowsSandboxUserStatus,
   getWindowsSandboxCaCert,
   verifyWindowsWfpEgress,
+  resolveSrtWin,
+  type SrtWinSpawn,
+  type WindowsBinShell,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
 } from './windows-sandbox-utils.js'
 import {
@@ -71,6 +83,7 @@ import { matchesDomainPattern } from './domain-pattern.js'
 import type { ChildProcess } from 'node:child_process'
 import type { ResolvedParentProxy } from './parent-proxy.js'
 import { EOL } from 'node:os'
+import { dirname } from 'node:path'
 
 interface HostNetworkManagerContext {
   httpProxyPort: number
@@ -90,6 +103,7 @@ let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
 let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
+let linuxMonitor: LinuxViolationMonitor | undefined
 let parentProxy: ResolvedParentProxy | undefined
 let mitmCA: MitmCA | undefined
 // Per-session proxy auth token. Generated at proxy start, exported only into
@@ -116,6 +130,11 @@ let windowsFsRawInputs: ReturnType<typeof rawWindowsFsInputs> | undefined
 // session-scoped — reset() does NOT clear this, so updateConfig()'s
 // reset+reinit and the test suite's per-test reset() don't re-verify.
 let windowsWfpVerified = false
+// Resolved once at initialize() (`resolveSrtWin` stats the disk).
+// Captured so wrapWithSandboxArgv/reset() don't re-resolve per call
+// and so reset()'s revoke/restore addresses the SAME binary the
+// grants/stamps were applied with even if `config` mutated between.
+let srtWinSpawn: SrtWinSpawn | undefined
 const sandboxViolationStore = new SandboxViolationStore()
 // Per-session sentinel↔real-value map for masked credentials. Lives only in
 // process memory; never written to disk or logged. Cleared on reset().
@@ -411,6 +430,26 @@ async function initialize(
     )
     logForDebugging('Started macOS sandbox log monitor')
   }
+  if (enableLogMonitor && getPlatform() === 'linux') {
+    linuxMonitor = startLinuxSandboxViolationMonitor(
+      sandboxViolationStore.addViolation.bind(sandboxViolationStore),
+      {
+        // apply-seccomp's observer reports every write-intent syscall
+        // (allowed or not). Only paths bwrap would actually refuse — outside
+        // allowWrite or inside a denyWrite carve-out — go to the store.
+        allowWritePaths: [
+          ...getDefaultWritePaths(),
+          ...config.filesystem.allowWrite,
+        ],
+        denyWritePaths: config.filesystem.denyWrite,
+        ignoreViolations: config.ignoreViolations,
+      },
+    )
+    // Don't block initialization on listen() — wrap-time checks
+    // fs.existsSync(observeSocketPath) and degrades gracefully.
+    void linuxMonitor.ready
+    logForDebugging('Started Linux seccomp violation monitor')
+  }
 
   // Register cleanup handlers first time
   registerCleanup()
@@ -420,7 +459,10 @@ async function initialize(
   // wrap-time) means the host gets a single actionable error before
   // any per-exec work happens, instead of exit-15 on every command.
   if (getPlatform() === 'windows') {
-    const u = getWindowsSandboxUserStatus()
+    // Resolve once (stats disk); captured module-level for wrap/reset.
+    srtWinSpawn = resolveSrtWin(runtimeConfig.windows?.srtWin)
+    const srtWin = srtWinSpawn
+    const u = getWindowsSandboxUserStatus({ srtWin })
     if (!u.provisioned || !u.credPresent) {
       config = undefined
       throw new Error(
@@ -442,6 +484,7 @@ async function initialize(
       try {
         await verifyWindowsWfpEgress({
           proxyPortRange: runtimeConfig.windows?.proxyPortRange,
+          srtWin,
         })
       } catch (e) {
         config = undefined
@@ -484,6 +527,19 @@ async function initialize(
     // Filesystem grants/denies — additive sandbox-user ACEs.
     try {
       const acc = computeWindowsFsAccessSet(runtimeConfig)
+      // The trust bundle the CA-trust env vars point at
+      // (NODE_EXTRA_CA_CERTS etc.) must be readable by the
+      // srt-sandbox child. It's written into the broker's %TEMP%,
+      // which the sandbox user has no inherent rights on, so it
+      // rides the same session-level `acl grant` read-set as the
+      // working tree. Granted on the mkdtemp DIR (not the file)
+      // so the (OI)(CI) ACE covers both the file open AND the
+      // parent-directory list that cmd's `type`/`FindFirstFile`
+      // does before opening. Mirrors the mac/linux
+      // `expandedAllowRead` push in wrapWithSandbox.
+      if (mitmCA) {
+        acc.grantRead.push(dirname(mitmCA.trustBundlePath))
+      }
       // `u` was fetched once above for the provisioning gate; the
       // same status carries the SID — don't re-spawn `srt-win user
       // status` here.
@@ -506,6 +562,7 @@ async function initialize(
           sandboxUserSid: sb,
           read: acc.grantRead,
           write: acc.grantWrite,
+          srtWin,
         })
       }
       if (acc.denyRead.length > 0 || acc.denyWrite.length > 0) {
@@ -513,6 +570,7 @@ async function initialize(
           sandboxUserSid: sb,
           denyRead: acc.denyRead,
           denyWrite: acc.denyWrite,
+          srtWin,
         })
       }
       // Only record when something was actually applied — gates
@@ -541,8 +599,8 @@ async function initialize(
       // failure (exit-2 partial stamps/grants the resolvable
       // inputs; harmless if nothing was — no holds for this PID).
       if (windowsFsSbUserSid) {
-        revokeWindowsAcl({ sandboxUserSid: windowsFsSbUserSid })
-        restoreWindowsAcl({ sandboxUserSid: windowsFsSbUserSid })
+        revokeWindowsAcl({ sandboxUserSid: windowsFsSbUserSid, srtWin })
+        restoreWindowsAcl({ sandboxUserSid: windowsFsSbUserSid, srtWin })
       }
       windowsFsSbUserSid = undefined
       config = undefined
@@ -582,6 +640,18 @@ async function initialize(
         : undefined
       const httpProxyPort = config.network.httpProxyPort ?? muxPort!
       const socksProxyPort = config.network.socksProxyPort ?? muxPort!
+      // Leaves are minted lazily per-CONNECT (after this point), so setting
+      // the CDP URL now means every leaf carries it. See MitmCA.crlUrl.
+      // Windows-only: on Linux the child runs under bwrap --unshare-net and
+      // reaches the proxy via a socat bridge on a fixed netns port, so a
+      // host-namespace mux port would be unreachable — worse than no CDP,
+      // since a Schannel-analog client (Java, OpenSSL with CRL_CHECK) then
+      // hard-fails "CRL fetch error" instead of soft-passing "no CDP". macOS
+      // has no in-tree Schannel-analog client. Also gated on `muxPort`: an
+      // external `network.httpProxyPort` doesn't answer /srt.crl.
+      if (mitmCA && muxPort !== undefined && getPlatform() === 'windows') {
+        mitmCA.crlUrl = `http://127.0.0.1:${muxPort}${CRL_PATH}`
+      }
       if (config.network.httpProxyPort !== undefined) {
         logForDebugging(`Using external HTTP proxy on port ${httpProxyPort}`)
       }
@@ -671,7 +741,18 @@ function checkDependencies(ripgrepConfig?: {
     errors.push(...linuxDeps.errors)
     warnings.push(...linuxDeps.warnings)
   } else if (platform === 'windows') {
-    const winDeps = checkWindowsDependencies(config?.windows?.wfpSublayerGuid)
+    let srtWin: SrtWinSpawn | undefined
+    try {
+      srtWin = resolveSrtWin(config?.windows?.srtWin)
+    } catch (e) {
+      errors.push((e as Error).message)
+      return { errors, warnings }
+    }
+    const winDeps = checkWindowsDependencies({
+      sublayerGuid:
+        config?.windows?.sublayerGuid ?? config?.windows?.wfpSublayerGuid,
+      srtWin,
+    })
     errors.push(...winDeps.errors)
     warnings.push(...winDeps.warnings)
   }
@@ -685,27 +766,10 @@ function checkDependencies(ripgrepConfig?: {
  *
  * Only explicitly declared sources are restricted: `mode: 'deny'` file
  * entries join the read-deny set, `mode: 'deny'` env vars are unset, and
- * `mode: 'mask'` env vars are set to a per-session sentinel registered in
- * {@link sentinelRegistry}. A masked var with no value in the host
- * environment is skipped — there is nothing to protect, and emitting an
- * unset var would change tool behaviour (presence checks would pass where
- * they didn't before).
- *
- * A masked var with `decode: 'jwt'` expects its whole value to be a JWT:
- * the value is verified ({@link verifyJwt}) and replaced by a JWT-shaped
- * fake ({@link mintFakeJwt}) registered as a caller-minted sentinel, so
- * token-parsing tools inside the sandbox keep working and the proxy swaps
- * the whole fake token on egress. With `maskClaims`, masking goes one
- * level deeper: each named top-level payload claim present with a string
- * value gets its own sentinel and the token is rebuilt around the modified
- * payload ({@link maskJwtClaims}); BOTH mappings are registered — the
- * whole fake token → the whole real token (a tool sending the token as a
- * bearer credential) and each claim sentinel → the real claim value (a
- * tool extracting the claim and sending it alone) — under the same
- * injectHosts. Named claims absent or non-string are skipped with a debug
- * log. A set value that does not verify — or, with `maskClaims`, verifies
- * but has no named claim present as a string — fails open with a loud
- * stderr warning (see {@link CredentialEnvVarConfigSchema}).
+ * `mode: 'mask'` env vars are set to a fake value (whole-value sentinel,
+ * the real value with extract-captured spans swapped for sentinels, or a
+ * JWT-shaped fake for `decode: 'jwt'` / `maskClaims` entries) registered
+ * in {@link sentinelRegistry} — see {@link buildMaskedEnvVars}.
  */
 function getCredentialRestrictions(
   credentials: CredentialsConfig | undefined,
@@ -724,97 +788,21 @@ function getCredentialRestrictions(
   const denyReadPaths = getCredentialDenyReadPaths(credentials)
 
   const unsetEnvVars: string[] = []
-  const setEnvVars: Record<string, string> = {}
   for (const v of credentials.envVars ?? []) {
-    if (v.mode === 'deny') {
-      unsetEnvVars.push(v.name)
-    } else if (v.mode === 'mask') {
-      const real = process.env[v.name]
-      if (real === undefined) continue
-      // Effective injectHosts: per-entry narrows; if unset, default to
-      // every reachable host (network.allowedDomains). injectHosts is an
-      // *optional narrowing*, not a required allowlist. Trade-off: a
-      // masked credential with no injectHosts is injectable at every host
-      // the sandbox can reach — narrow it explicitly when the credential
-      // should only go to a subset.
-      const injectHosts = v.injectHosts ?? allowedDomains ?? []
-      if (v.decode === 'jwt') {
-        if (!verifyJwt(real)) {
-          // Nothing was masked — the operator declared the value a JWT but
-          // it isn't one. Fail open with a loud warning (parallel to the
-          // files onExtractNoMatch "warn" default); this will route
-          // through a per-entry policy once env-var extraction lands.
-          const msg =
-            `[sandbox-runtime] WARNING: credentials.envVars entry ` +
-            `"${v.name}" has decode "jwt" but its value did not verify ` +
-            `as a JWT. The variable is left UNPROTECTED (real value ` +
-            `visible as-is inside the sandbox). Fix the config or remove ` +
-            `the entry.`
-          console.warn(msg)
-          logForDebugging(msg, { level: 'warn' })
-          continue
-        }
-        if (v.maskClaims?.length) {
-          // Claim-level masking: sentinels go INSIDE the payload; the
-          // rebuilt fake token is itself registered as a sentinel for the
-          // whole real token, so both the bearer path (token sent
-          // verbatim) and the extracted-claim path substitute on egress.
-          const masked = maskJwtClaims(real, v.maskClaims, (claim, value) =>
-            sentinelRegistry.register(
-              `env:${v.name}#${claim}`,
-              value,
-              injectHosts,
-            ),
-          )
-          if (masked === null) {
-            // A verified JWT none of whose named claims are present as
-            // strings: nothing was masked — same fail-open posture as a
-            // value that does not verify (this will route through a
-            // per-entry policy once onExtractNoMatch unifies with env vars).
-            const msg =
-              `[sandbox-runtime] WARNING: credentials.envVars entry ` +
-              `"${v.name}" has maskClaims ` +
-              `${JSON.stringify(v.maskClaims)} but none is present as a ` +
-              `string claim in its JWT value. The variable is left ` +
-              `UNPROTECTED (real value visible as-is inside the sandbox). ` +
-              `Fix the config or remove the entry.`
-            console.warn(msg)
-            logForDebugging(msg, { level: 'warn' })
-            continue
-          }
-          const skipped = v.maskClaims.filter(
-            c => !masked.claimSentinels.has(c),
-          )
-          if (skipped.length > 0) {
-            logForDebugging(
-              `[credential-mask] env var "${v.name}": maskClaims ` +
-                `${JSON.stringify(skipped)} absent or non-string in the ` +
-                `JWT — skipped.`,
-            )
-          }
-          setEnvVars[v.name] = sentinelRegistry.registerWithSentinel(
-            'env:' + v.name,
-            masked.fakeToken,
-            real,
-            injectHosts,
-          )
-          continue
-        }
-        // JWT-shaped fake so token-parsing tools inside the sandbox keep
-        // working; the proxy swaps the whole fake token on egress. Keyed
-        // env:<NAME> — caller-minted keys stay disjoint from the file:
-        // namespace and from plain masked env vars.
-        setEnvVars[v.name] = sentinelRegistry.registerWithSentinel(
-          'env:' + v.name,
-          mintFakeJwt(randomUUID()),
-          real,
-          injectHosts,
-        )
-        continue
-      }
-      setEnvVars[v.name] = sentinelRegistry.register(v.name, real, injectHosts)
-    }
+    if (v.mode === 'deny') unsetEnvVars.push(v.name)
   }
+
+  // Masked env vars: read the real value from the host environment,
+  // register sentinel(s), and set the variable to the fake value inside
+  // the sandbox. degradeToUnsetNames carries variables whose extract
+  // pattern matched nothing with onExtractNoMatch: "deny" — merged into
+  // unsetEnvVars below so the value is withheld rather than exposed.
+  const { setEnvVars, degradeToUnsetNames } = buildMaskedEnvVars(
+    credentials.envVars ?? [],
+    allowedDomains ?? [],
+    sentinelRegistry,
+  )
+  unsetEnvVars.push(...degradeToUnsetNames)
 
   // Masked files: read the real bytes on the host, register a sentinel,
   // write it to a fake file in the manager-owned temp dir. Missing/unreadable
@@ -989,7 +977,7 @@ function computeWindowsFsAccessSet(c: SandboxRuntimeConfig): {
   if (fs?.disabled) {
     return { grantRead: [], grantWrite: [], denyRead: [], denyWrite: [] }
   }
-  const expand = expandWindowsFsDenyPaths
+  const expand = expandWindowsFsPaths
   const denyRead = expand([
     ...new Set([
       ...(fs?.denyRead ?? []),
@@ -1362,6 +1350,7 @@ async function wrapWithSandbox(
         seccompConfig: getSeccompConfig(),
         bwrapPath: config?.bwrapPath,
         socatPath: config?.socatPath,
+        observeSocketPath: linuxMonitor?.observeSocketPath,
         abortSignal,
       })
 
@@ -1397,12 +1386,20 @@ async function wrapWithSandbox(
  * macOS/Linux `argv` is `[binShell, '-c', <wrapWithSandbox result>]`
  * (proxy env is baked into that command) and `env` is the unchanged
  * `process.env`, so callers can spawn uniformly across platforms.
+ *
+ * @param cwd the working directory the caller will spawn the result
+ *   with. On Windows the child's cwd is whatever the caller passes
+ *   as the spawn `{cwd:}` option (there is no `--cwd` flag), and
+ *   the `safe.directory` git-config injection derives from this — so
+ *   pass the same value here as to `spawn({cwd})`. Defaults to
+ *   `process.cwd()`. Currently unused on macOS/Linux.
  */
 async function wrapWithSandboxArgv(
   command: string,
-  binShell?: string,
+  binShell?: string | WindowsBinShell,
   customConfig?: Partial<SandboxRuntimeConfig>,
   abortSignal?: AbortSignal,
+  cwd?: string,
 ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }> {
   const platform = getPlatform()
 
@@ -1419,7 +1416,7 @@ async function wrapWithSandboxArgv(
     )
     // Per-exec FILE denies (customConfig only — the session-level
     // config's denies were already stamped at initialize()).
-    // Paths go through `expandWindowsFsDenyPaths` — the SAME
+    // Paths go through `expandWindowsFsPaths` — the SAME
     // chokepoint the session-level set uses (point-in-time glob
     // expand, normalize, missing→drop) — so a per-exec entry
     // resolves identically to its session-level equivalent.
@@ -1460,7 +1457,7 @@ async function wrapWithSandboxArgv(
       if (rawRead.length > 0 || rawWrite.length > 0) {
         const sessRead = new Set(windowsFsStampedSet?.denyRead ?? [])
         const sessWrite = new Set(windowsFsStampedSet?.denyWrite ?? [])
-        const expand = expandWindowsFsDenyPaths
+        const expand = expandWindowsFsPaths
         perExecDenyRead = expand(rawRead).filter(p => !sessRead.has(p))
         perExecDenyWrite = expand(rawWrite).filter(
           p => !sessRead.has(p) && !sessWrite.has(p),
@@ -1487,13 +1484,27 @@ async function wrapWithSandboxArgv(
       setEnvVars: credentialRestrictions.setEnvVars,
       denyRead: perExecDenyRead,
       denyWrite: perExecDenyWrite,
+      // safe.directory: cwd + the resolved session-level write
+      // grants — exactly the working-tree roots the sandbox user
+      // has MODIFY on and where git will see real-user-owned files.
+      cwd,
+      allowWrite: windowsFsStampedSet?.grantWrite,
       caCertPath: mitmCA?.trustBundlePath,
       binShell: parseWindowsBinShell(binShell),
+      srtWin: customConfig?.windows?.srtWin
+        ? resolveSrtWin(customConfig.windows.srtWin)
+        : (srtWinSpawn ?? resolveSrtWin(config?.windows?.srtWin)),
     })
   }
 
   // macOS/Linux: delegate to the existing string wrapper, then put
   // the result behind `<shell> -c` so the caller's argv-spawn works.
+  if (typeof binShell === 'object') {
+    throw new Error(
+      'binShell object form is Windows-only; pass a shell path string ' +
+        'on macOS/Linux',
+    )
+  }
   const wrapped = await wrapWithSandbox(
     command,
     binShell,
@@ -1516,7 +1527,7 @@ function getConfig(): SandboxRuntimeConfig | undefined {
  * Update the sandbox configuration in place.
  *
  * **Network/allowlist changes are a live swap**: the running
- * http/socks proxies read `config.network.allowedDomains` /
+ * mux proxy reads `config.network.allowedDomains` /
  * `deniedDomains` per-request (via `filterNetworkRequest`), so
  * reassigning `config` here takes effect on the next connection
  * with no proxy rebind and no port change — on every platform,
@@ -1692,6 +1703,9 @@ async function reset(): Promise<void> {
   // `srt-win acl recover` (which sweeps by trustee SID).
   if (windowsFsStampedSet && windowsFsSbUserSid) {
     const sb = windowsFsSbUserSid
+    // Captured at initialize() — the SAME binary the grants/stamps
+    // were applied with, immune to `config` mutation between.
+    const srtWin = srtWinSpawn
     // 'restored'/'alreadyOriginal' are the pre- same-user-removal
     // srt-win's success vocabulary; 'revoked'/'stillHeld' are the
     // post-. Either is non-anomalous.
@@ -1706,16 +1720,17 @@ async function reset(): Promise<void> {
         )
       }
     }
-    for (const e of revokeWindowsAcl({ sandboxUserSid: sb }) ?? []) {
+    for (const e of revokeWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
       log('grant revoke', e)
     }
-    for (const e of restoreWindowsAcl({ sandboxUserSid: sb }) ?? []) {
+    for (const e of restoreWindowsAcl({ sandboxUserSid: sb, srtWin }) ?? []) {
       log('deny restore', e)
     }
   }
   windowsFsStampedSet = undefined
   windowsFsSbUserSid = undefined
   windowsFsRawInputs = undefined
+  srtWinSpawn = undefined
   // windowsWfpVerified is NOT cleared — per-process, not per-session.
 
   // Clean up any leftover bwrap mount points. Force past the
@@ -1726,6 +1741,10 @@ async function reset(): Promise<void> {
   if (logMonitorShutdown) {
     logMonitorShutdown()
     logMonitorShutdown = undefined
+  }
+  if (linuxMonitor) {
+    linuxMonitor.stop()
+    linuxMonitor = undefined
   }
 
   if (managerContext?.linuxBridge) {
@@ -1916,9 +1935,10 @@ export interface ISandboxManager {
   ): Promise<string>
   wrapWithSandboxArgv(
     command: string,
-    binShell?: string,
+    binShell?: string | WindowsBinShell,
     customConfig?: Partial<SandboxRuntimeConfig>,
     abortSignal?: AbortSignal,
+    cwd?: string,
   ): Promise<{ argv: string[]; env: NodeJS.ProcessEnv }>
   getSandboxViolationStore(): SandboxViolationStore
   annotateStderrWithSandboxFailures(command: string, stderr: string): string

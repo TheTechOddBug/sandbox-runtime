@@ -47,6 +47,7 @@ export { type SandboxDependencyCheck } from './sandbox/linux-sandbox-utils.js'
 // Windows install/status API
 export {
   getSrtWinPath,
+  resolveSrtWin,
   getWindowsWfpStatus,
   verifyWindowsWfpEgress,
   getWindowsSandboxUserStatus,
@@ -59,10 +60,14 @@ export {
   restoreWindowsAcl,
   grantWindowsAcl,
   revokeWindowsAcl,
-  expandWindowsFsDenyPaths,
+  expandWindowsFsPaths,
+  buildGitConfigEnv,
+  parseWindowsBinShell,
   DEFAULT_WINDOWS_PROXY_PORT_RANGE,
+  SRT_WIN_DISPATCH_ARG1,
 } from './sandbox/windows-sandbox-utils.js'
 export type {
+  WindowsBinShell,
   WindowsInstallOptions,
   WindowsInstallResult,
   WindowsWfpStatus,
@@ -72,9 +77,13 @@ export type {
   WindowsWfpStatusResult,
   WindowsWfpVerifyResult,
   WindowsSandboxUserStatus,
+  SrtWinSpawn,
 } from './sandbox/windows-sandbox-utils.js'
-export type { WindowsConfig } from './sandbox/sandbox-config.js'
-export { WindowsConfigSchema } from './sandbox/sandbox-config.js'
+export type { WindowsConfig, SrtWinConfig } from './sandbox/sandbox-config.js'
+export {
+  WindowsConfigSchema,
+  SrtWinConfigSchema,
+} from './sandbox/sandbox-config.js'
 
 // Utility functions
 export { getDefaultWritePaths } from './sandbox/sandbox-utils.js'
