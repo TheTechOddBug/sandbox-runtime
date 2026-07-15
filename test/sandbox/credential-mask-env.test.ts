@@ -333,7 +333,10 @@ describe.if(isLinux)('structured env masking on Linux (bwrap)', () => {
     expect(result.status).toBe(0)
     const seen = result.stdout.trim()
     expect(seen.startsWith(SENTINEL_PREFIX)).toBe(true)
-    expect(seen.length).toBe(SENTINEL_PREFIX.length + 36)
+    // DB_URL is longer than the 47-byte base sentinel, so the mint pads the
+    // sentinel to the real value's byte length (length-matched sentinels
+    // keep Content-Length invariant under body substitution).
+    expect(seen.length).toBe(Buffer.byteLength(DB_URL))
     expect(SandboxManager.getSentinelRegistry().lookupReal(seen)).toBe(DB_URL)
 
     // Restore the suite-level (extract) config for any following tests.
