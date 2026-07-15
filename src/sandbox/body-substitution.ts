@@ -15,7 +15,10 @@
  * value reaches the API and auth fails — never a leaked secret.
  */
 
+import type { IncomingHttpHeaders, IncomingMessage } from 'node:http'
 import { Transform } from 'node:stream'
+import { logForDebugging } from '../utils/debug.js'
+import { BODYLESS_METHODS } from './request-filter.js'
 
 /** One sentinel→real replacement, as raw bytes. */
 export interface SentinelBufferPair {
@@ -39,6 +42,47 @@ export function allLengthMatched(
   pairs: readonly SentinelBufferPair[],
 ): boolean {
   return pairs.every(p => p.sentinel.length === p.realValue.length)
+}
+
+/**
+ * Build the substitution Transform for one forwarded request, or undefined
+ * when the body must keep the existing bare pipe, byte-identical: bodyless
+ * method, no credential injectable at `destHost`, or a Content-Encoding the
+ * byte scan cannot see through.
+ *
+ * When substitution can change the body length (some injectable sentinel is
+ * not length-matched with its real value — e.g. a caller-minted JWT-shaped
+ * fake), Content-Length is deleted from `fwdHeaders` so the outbound
+ * request re-frames as chunked; otherwise Content-Length stays verbatim.
+ */
+export function prepareBodySubstitution(
+  getBodySubstitutions: GetBodySubstitutions | undefined,
+  req: IncomingMessage,
+  fwdHeaders: IncomingHttpHeaders,
+  destHost: string,
+): Transform | undefined {
+  if (getBodySubstitutions === undefined) return undefined
+  if (BODYLESS_METHODS.has(req.method ?? 'GET')) return undefined
+  const pairs = getBodySubstitutions(destHost)
+  if (!pairs?.length) return undefined
+  if (req.headers['content-encoding'] !== undefined) {
+    // Fail-safe direction: an encoded body cannot be scanned for sentinel
+    // bytes, so it passes through unchanged — a sentinel in it reaches the
+    // upstream as the useless fake and auth fails, but the real secret
+    // cannot leak. Warn so the resulting 401 is diagnosable.
+    logForDebugging(
+      `[body-substitution] ${destHost}: request body has Content-Encoding ` +
+        `"${String(req.headers['content-encoding'])}"; masked-credential ` +
+        `substitution skipped — a sentinel in this body reaches the ` +
+        `upstream as the fake value`,
+      { level: 'warn' },
+    )
+    return undefined
+  }
+  if (!allLengthMatched(pairs)) {
+    delete fwdHeaders['content-length']
+  }
+  return createBodySubstitutionTransform(pairs)
 }
 
 /**
