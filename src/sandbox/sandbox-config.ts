@@ -1219,8 +1219,8 @@ export const SandboxRuntimeConfigSchema = z
             code: z.ZodIssueCode.custom,
             path,
             message:
-              `"${name}" appears in more than one awsPairs slot — each ` +
-              `variable can belong to at most one pair.`,
+              `"${name}" appears in more than one awsPairs slot (within ` +
+              `or across pairs) — each variable can fill exactly one slot.`,
           })
           continue
         }
