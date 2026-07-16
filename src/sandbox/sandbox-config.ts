@@ -554,6 +554,12 @@ const sigv4PolicySchema = z.enum(['deny', 'passthrough'])
  *   header substitution still applies, but the signature was computed
  *   from the masked placeholder secret, so the upstream will reject it —
  *   set this only when that failure mode is preferable to a proxy denial.
+ *
+ * Re-signable header-SigV4 requests that sign a literal body hash are
+ * buffered (up to 64 MiB — MAX_SIGV4_RESIGN_BODY_BYTES in
+ * tls-terminate-proxy.ts) so the hash can be recomputed over the bytes
+ * actually forwarded; larger bodies are denied with a 403. Payloads
+ * signed as UNSIGNED-PAYLOAD stream through without buffering.
  */
 export const Sigv4ConfigSchema = z
   .object({

@@ -17,7 +17,8 @@ import { createServer as createHttpsServer } from 'node:https'
 import type { IncomingHttpHeaders, IncomingMessage } from 'node:http'
 import type { Server, AddressInfo } from 'node:net'
 import { spawn } from 'node:child_process'
-import { readFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { SentinelRegistry } from '../../src/sandbox/credential-sentinel.js'
 import {
@@ -32,6 +33,7 @@ import {
   UNSIGNED_PAYLOAD,
 } from '../../src/sandbox/aws-sigv4.js'
 import { createHttpProxyServer } from '../../src/sandbox/http-proxy.js'
+import { MAX_SIGV4_RESIGN_BODY_BYTES } from '../../src/sandbox/tls-terminate-proxy.js'
 import { createMitmCA, disposeMitmCA } from '../../src/sandbox/mitm-ca.js'
 import { mintLeafCert } from '../../src/sandbox/mitm-leaf.js'
 import type { Sigv4Config } from '../../src/sandbox/sandbox-config.js'
@@ -100,6 +102,8 @@ async function curlViaProxy(
     headers?: string[]
     method?: string
     data?: string
+    /** Path to a file sent as the request body (--data-binary @file). */
+    dataFile?: string
     awsSigv4?: { akid: string; secret: string }
   } = {},
 ): Promise<CurlResult> {
@@ -116,6 +120,8 @@ async function curlViaProxy(
   ]
   if (opts.method) args.push('-X', opts.method)
   if (opts.data !== undefined) args.push('--data-binary', opts.data)
+  if (opts.dataFile !== undefined)
+    args.push('--data-binary', `@${opts.dataFile}`)
   if (opts.awsSigv4) {
     args.push(
       '--aws-sigv4',
@@ -148,7 +154,11 @@ async function curlViaProxy(
 }
 
 /** One TLS upstream + one terminating proxy with the given SigV4 config. */
-function makeStack(opts: { sigv4?: Sigv4Config; sessionToken?: boolean }) {
+function makeStack(opts: {
+  sigv4?: Sigv4Config
+  sessionToken?: boolean
+  maxSigv4ResignBodyBytes?: number
+}) {
   const ca = createMitmCA({ caCertPath: CA_CERT, caKeyPath: CA_KEY })
   const sentinels = new SentinelRegistry()
   const pairs = new AwsPairRegistry()
@@ -213,6 +223,9 @@ function makeStack(opts: { sigv4?: Sigv4Config; sessionToken?: boolean }) {
       mutateHeaders: (headers, destHost) =>
         sentinels.substituteInHeaders(headers, destHost, eq),
       planSigv4: createSigv4Planner(pairs, opts.sigv4, eq),
+      ...(opts.maxSigv4ResignBodyBytes !== undefined
+        ? { maxSigv4ResignBodyBytes: opts.maxSigv4ResignBodyBytes }
+        : {}),
     })
     await new Promise<void>(r => proxy.listen(0, '127.0.0.1', () => r()))
     state.proxy = proxy
@@ -431,6 +444,81 @@ describe('SigV4 re-signing through the TLS-terminating proxy', () => {
     expect(r.status).toBe(200)
     expect(singleHeader(state.captured!.headers['x-api-key'])).toBe(REAL_AKID)
   }, 20000)
+})
+
+describe('literal-hash body buffering cap', () => {
+  // The production 64 MiB cap (MAX_SIGV4_RESIGN_BODY_BYTES) is injected
+  // smaller here so the over-cap denial doesn't need a 64 MiB fixture
+  // upload per test; the mechanism under test is identical.
+  const CAP = 256 * 1024
+  const stack = makeStack({ maxSigv4ResignBodyBytes: CAP })
+  const { state } = stack
+  let bodyDir: string
+  let underCapFile: string
+  let overCapFile: string
+
+  beforeAll(async () => {
+    await stack.start()
+    bodyDir = mkdtempSync(join(tmpdir(), 'srt-sigv4-body-'))
+    underCapFile = join(bodyDir, 'under')
+    overCapFile = join(bodyDir, 'over')
+    writeFileSync(underCapFile, Buffer.alloc(CAP, 'a'))
+    writeFileSync(overCapFile, Buffer.alloc(CAP + 1, 'a'))
+  })
+  afterAll(async () => {
+    rmSync(bodyDir, { recursive: true, force: true })
+    await stack.stop()
+  })
+
+  test('the default cap is the exported 64 MiB constant', () => {
+    expect(MAX_SIGV4_RESIGN_BODY_BYTES).toBe(64 * 1024 * 1024)
+  })
+
+  test('a body at the cap is buffered and re-signed', async () => {
+    state.captured = undefined
+    const r = await curlViaProxy(
+      state.proxyPort!,
+      `https://${DEST}:${state.upstreamPort}/bucket/key`,
+      {
+        method: 'PUT',
+        dataFile: underCapFile,
+        awsSigv4: { akid: state.fakeAkid, secret: state.fakeSecret },
+        // curl sends Expect: 100-continue for large bodies; disable so
+        // the flow matches the small-body tests.
+        headers: ['Expect:'],
+      },
+    )
+    expect(r.exit).toBe(0)
+    expect(r.status).toBe(200)
+    const captured = state.captured!
+    expect(captured.body.length).toBe(CAP)
+    verifyUpstreamSignature(captured)
+  }, 30000)
+
+  test('a body over the cap fails closed with a 403, nothing upstream', async () => {
+    state.captured = undefined
+    const r = await curlViaProxy(
+      state.proxyPort!,
+      `https://${DEST}:${state.upstreamPort}/bucket/key`,
+      {
+        method: 'PUT',
+        dataFile: overCapFile,
+        awsSigv4: { akid: state.fakeAkid, secret: state.fakeSecret },
+        headers: ['Expect:'],
+      },
+    )
+    expect(r.status).toBe(403)
+    expect(r.body).toContain(`${CAP}-byte`)
+    expect(r.body).toContain('UNSIGNED-PAYLOAD')
+    expect(state.captured).toBeUndefined()
+    // The proxy survived: a follow-up request still works.
+    const r2 = await curlViaProxy(
+      state.proxyPort!,
+      `https://${DEST}:${state.upstreamPort}/`,
+      { awsSigv4: { akid: state.fakeAkid, secret: state.fakeSecret } },
+    )
+    expect(r2.status).toBe(200)
+  }, 30000)
 })
 
 describe('policies for non-re-signable SigV4 shapes', () => {

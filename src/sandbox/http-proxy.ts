@@ -102,6 +102,14 @@ export interface HttpProxyServerOptions {
   planSigv4?: PlanSigv4
 
   /**
+   * Override for the SigV4 literal-hash body buffering cap
+   * (MAX_SIGV4_RESIGN_BODY_BYTES). Primarily a test seam — exercising the
+   * over-cap denial with the production 64 MiB value would need a 64 MiB
+   * fixture upload per test.
+   */
+  maxSigv4ResignBodyBytes?: number
+
+  /**
    * Additional trusted CA(s) for the terminating proxy's outbound TLS leg.
    * Unset → system roots + NODE_EXTRA_CA_CERTS. Primarily a test seam.
    */
@@ -214,6 +222,7 @@ export function createHttpProxyServer(options: HttpProxyServerOptions): Server {
             peeked.head,
             { hostname, port, upstreamCA: options.tlsTerminateUpstreamCA },
             options.planSigv4,
+            options.maxSigv4ResignBodyBytes,
           )
           return
         }
