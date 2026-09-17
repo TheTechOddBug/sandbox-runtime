@@ -580,6 +580,57 @@ function errorText(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
+/** Why a bubblewrap profile could not be run. */
+export type LinuxSandboxProfileErrorCode =
+  /** More arguments than bubblewrap parses, on the line or through a file. */
+  | 'too_many_arguments'
+  /** A mount path holds a NUL byte, which no carrier of arguments can hold. */
+  | 'nul_in_path'
+  /**
+   * No unnamed file could be opened to carry the mounts: passing (this
+   * process is out of descriptors) or lasting (no directory on this host
+   * takes one). The error on `.cause` names each directory tried and what it
+   * said.
+   */
+  | 'args_file_unavailable'
+  /** The line does not fit one shell argument even with the mounts in a file. */
+  | 'command_too_long'
+
+/**
+ * Thrown when a Linux bubblewrap profile cannot be run on this host: what the
+ * configuration expands to is past a limit, or, for `command_too_long` and
+ * `nul_in_path`, what the caller passed in is. The command was not run and no
+ * profile file stays open, so do not run the per-command cleanup
+ * (`cleanupAfterCommand()`, `cleanupBwrapMountPoints()`) for a wrap that
+ * threw: it would release a second time, and a sandbox still running would
+ * lose its mount points. Branch on `.code`, never on `.message`, which
+ * carries the sizes of the moment. Other wrap-time failures (a shell that is
+ * not on PATH, a bridge socket that is gone) are plain Errors.
+ */
+export class LinuxSandboxProfileError extends Error {
+  readonly code: LinuxSandboxProfileErrorCode
+  declare readonly cause?: unknown
+  constructor(
+    code: LinuxSandboxProfileErrorCode,
+    message: string,
+    cause?: unknown,
+  ) {
+    super(message)
+    this.name = 'LinuxSandboxProfileError'
+    this.code = code
+    if (cause !== undefined) {
+      // Non-enumerable, as a native `cause` is. Once the compile target is
+      // ES2022 this is `super(message, { cause })`.
+      Object.defineProperty(this, 'cause', {
+        value: cause,
+        writable: true,
+        configurable: true,
+        enumerable: false,
+      })
+    }
+  }
+}
+
 /**
  * The shell string that runs bwrap with `bwrapArgs`, which the caller runs
  * as one argument of `sh -c`. When that would not fit the kernel's
@@ -589,8 +640,7 @@ function errorText(error: unknown): string {
  * again through /proc. Every other word, the per-command environment and the
  * command among them, stays on the line. The result stays a simple command,
  * so a prefix (`exec`, `timeout 30`) or a suffix (`&& next`) still composes.
- * Throws when the profile cannot run: too many words for bwrap, no unnamed
- * file to put the mounts in, or a line too long even without them.
+ * Throws {@link LinuxSandboxProfileError} when the profile cannot run.
  */
 function renderBwrapInvocation(
   bwrapBinary: string,
@@ -598,8 +648,18 @@ function renderBwrapInvocation(
   mounts: { start: number; end: number },
 ): string {
   if (bwrapArgs.length > BWRAP_MAX_ARGS) {
-    throw new Error(
-      `Sandbox profile has ${bwrapArgs.length} bwrap arguments and bwrap accepts at most ${BWRAP_MAX_ARGS} (about ${BWRAP_MAX_ARGS / 3} mounts); reduce the number of paths the configuration expands to`,
+    throw new LinuxSandboxProfileError(
+      'too_many_arguments',
+      `Sandbox profile has ${bwrapArgs.length} bwrap arguments and bwrap accepts at most ${BWRAP_MAX_ARGS} (about ${BWRAP_MAX_ARGS / 3} mounts); reduce what the configuration expands to: each path takes about three arguments, each environment variable two`,
+    )
+  }
+  const mountWords = bwrapArgs.slice(mounts.start, mounts.end)
+  // A command line ends at a NUL and bwrap splits an args file on one, so the
+  // word is cut short on the line and becomes several options in the file.
+  if (mountWords.some(word => word.includes('\0'))) {
+    throw new LinuxSandboxProfileError(
+      'nul_in_path',
+      'Sandbox profile contains a path with a NUL byte, which neither a command line nor a file of bwrap arguments can carry',
     )
   }
   const inline = quote([bwrapBinary, ...bwrapArgs])
@@ -612,23 +672,19 @@ function renderBwrapInvocation(
   const tooLong = `Sandbox profile is too long for the command line (${inlineBytes} bytes; past ${limit - ARG_HEADROOM_BYTES} it goes through a file)`
   // `--args <fd>` are two more words.
   if (bwrapArgs.length + 2 > BWRAP_MAX_ARGS) {
-    throw new Error(
+    throw new LinuxSandboxProfileError(
+      'too_many_arguments',
       `${tooLong} and, passed through a file, would exceed the ${BWRAP_MAX_ARGS} arguments bwrap accepts`,
-    )
-  }
-  const mountWords = bwrapArgs.slice(mounts.start, mounts.end)
-  if (mountWords.some(word => word.includes('\0'))) {
-    // bwrap splits the file on NUL: the word would become several options.
-    throw new Error(
-      `${tooLong} and contains a path with a NUL byte, which a file of bwrap arguments cannot carry`,
     )
   }
   let argsFd: number
   try {
     argsFd = openBwrapArgsProfile(mountWords)
   } catch (error) {
-    throw new Error(
+    throw new LinuxSandboxProfileError(
+      'args_file_unavailable',
       `${tooLong} and cannot be passed through a file: ${errorText(error)}`,
+      error,
     )
   }
   // /bin/sh opens the profile on the fd and execs bwrap, which reads it to
@@ -648,7 +704,8 @@ function renderBwrapInvocation(
   const viaArgsFileBytes = Buffer.byteLength(viaArgsFile, 'utf8')
   if (viaArgsFileBytes > limit) {
     closeBwrapArgsProfile(argsFd)
-    throw new Error(
+    throw new LinuxSandboxProfileError(
+      'command_too_long',
       `Sandboxed command is too long for one shell argument even with the mounts passed through a file (${viaArgsFileBytes} bytes; the limit here is ${limit})`,
     )
   }
