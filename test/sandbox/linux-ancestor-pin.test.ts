@@ -327,18 +327,23 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     return {
       dataDir,
       secretsLink,
+      secretsCanonical: join(dataDir, 'secrets'),
       secretCanonical: join(dataDir, 'secrets', 'secret.txt'),
       filesystem: { denyRead: [secretsLink] },
     }
   }
 
   it('pins an ancestor that contains a symlink-spelled read-deny tmpfs location; the tmpfs still lands on top', async () => {
-    const { dataDir, secretsLink, filesystem } = symlinkSpelledTmpfs()
+    const { dataDir, secretsLink, secretsCanonical, filesystem } =
+      symlinkSpelledTmpfs()
 
     const command = await wrap(filesystem)
 
-    const tmpfsOp = indexOfMount(command, '--tmpfs', secretsLink)
+    // The tmpfs goes where the link leads, never on the link itself.
+    expect(countMounts(command, '--tmpfs', secretsLink)).toBe(0)
+    const tmpfsOp = indexOfMount(command, '--tmpfs', secretsCanonical)
     const dataPin = indexOfMount(command, '--ro-bind', dataDir, dataDir)
+    expect(tmpfsOp).toBeGreaterThan(-1)
     expect(dataPin).toBeGreaterThan(-1)
     expect(dataPin).toBeLessThan(tmpfsOp)
   })
@@ -390,12 +395,15 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
   }
 
   it('restores a canonical allowWrite carve-out inside a symlink-spelled denyRead', async () => {
-    const { wDir, linkD, filesystem } = carveOutInsideSymlinkSpelledDenyRead()
+    const { dDir, wDir, linkD, filesystem } =
+      carveOutInsideSymlinkSpelledDenyRead()
 
     const command = await wrap(filesystem)
 
-    // The carve-out's writable re-bind must follow the tmpfs.
-    const tmpfsOp = lastIndexOfMount(command, '--tmpfs', linkD)
+    // The carve-out's writable re-bind must follow the tmpfs, which lands
+    // where the link leads.
+    expect(countMounts(command, '--tmpfs', linkD)).toBe(0)
+    const tmpfsOp = lastIndexOfMount(command, '--tmpfs', dDir)
     expect(tmpfsOp).toBeGreaterThan(-1)
     expect(lastIndexOfMount(command, '--bind', wDir, wDir)).toBeGreaterThan(
       tmpfsOp,
@@ -550,9 +558,11 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     // asserting the absence of one spelling would pass for a restore spelled
     // `--ro-bind <name> <name>`, which bwrap resolves to the same inode.
     expect(lastMountAt(command, netrcName)).toBeUndefined()
-    expect(
-      indexOfMount(command, '--ro-bind', '/dev/null', netrcTarget),
-    ).toBeGreaterThan(-1)
+    // The target's own mask is not emitted: it would land inside the tmpfs
+    // the home directory's deny already put over it, and one mount per
+    // location is all this wrap makes. The entry still says the target is
+    // denied, which is what costs the carve-out its restore above.
+    expect(countMounts(command, '--ro-bind', '/dev/null', netrcTarget)).toBe(0)
 
     // The control: an ordinary directory carve-out keeps its restore, and
     // the deeper deny lands inside it.
@@ -589,7 +599,9 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     })
 
     expect(lastMountAt(command, netrcName)).toBeUndefined()
-    expect(indexOfMount(command, '--tmpfs', storeDir)).toBeGreaterThan(-1)
+    // No tmpfs of its own: the store lies under the home directory's, which
+    // hides it already. It is a denial around the target all the same.
+    expect(countMounts(command, '--tmpfs', storeDir)).toBe(0)
   })
 
   it('drops a symlinked carve-out reached through more than one link', async () => {
@@ -832,7 +844,10 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
       allowRead: [docsName],
     })
 
-    expect(indexOfMount(command, '--tmpfs', appDir)).toBeGreaterThan(-1)
+    // The stand-in names the app directory, which the home directory's tmpfs
+    // hides already, so it is not mounted a second time; the carve-out is
+    // refused against where the stand-in would have landed.
+    expect(countMounts(command, '--tmpfs', appDir)).toBe(0)
     expect(lastMountAt(command, docsName)).toBeUndefined()
   })
 
@@ -1277,20 +1292,22 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     return {
       wDir,
       dLink,
+      dDir: join(PROJECT, 'd'),
       secretCanonical: join(wDir, 'secret'),
       filesystem: { denyRead: [sLink, dLink], allowWrite: [wDir] },
     }
   }
 
   it('restores a write path around a symlink-spelled mask inside it; the mask lands on top', async () => {
-    const { wDir, dLink, secretCanonical, filesystem } =
+    const { wDir, dLink, dDir, secretCanonical, filesystem } =
       maskInsideRestoredWritePath()
 
     const command = await wrap(filesystem)
 
     // s-link is spelled shallower than link but lands deeper, so it mounts
-    // after link's tmpfs and after w's restore.
-    const tmpfsOp = lastIndexOfMount(command, '--tmpfs', dLink)
+    // after link's tmpfs and after w's restore. Both land where they lead.
+    expect(countMounts(command, '--tmpfs', dLink)).toBe(0)
+    const tmpfsOp = lastIndexOfMount(command, '--tmpfs', dDir)
     const wBind = lastIndexOfMount(command, '--bind', wDir, wDir)
     const mask = lastIndexOfMount(
       command,
@@ -1388,6 +1405,7 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
     return {
       secretCanonical,
       dLink,
+      dDir: join(PROJECT, 'd'),
       filesystem: {
         denyRead: [sLink, dLink],
         allowWrite: [secretCanonical],
@@ -1396,12 +1414,13 @@ describe.if(isLinux)('Linux sandbox — denyWrite ancestor pinning', () => {
   }
 
   it('masks a read-denied file on top of an allowWrite entry naming the same file', async () => {
-    const { secretCanonical, dLink, filesystem } =
+    const { secretCanonical, dLink, dDir, filesystem } =
       maskOverAllowWriteOfTheSameFile()
 
     const command = await wrap(filesystem)
 
-    const tmpfsOp = lastIndexOfMount(command, '--tmpfs', dLink)
+    expect(countMounts(command, '--tmpfs', dLink)).toBe(0)
+    const tmpfsOp = lastIndexOfMount(command, '--tmpfs', dDir)
     const fileBind = lastIndexOfMount(
       command,
       '--bind',
